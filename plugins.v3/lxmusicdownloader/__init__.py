@@ -644,15 +644,21 @@ class LxMusicDownloader(_PluginBase):
             logger.error(f"【LX音乐下载】注册探索源失败：{e}")
 
     def api_discover(self, cat: str = "排行榜", chart: str = "网易云·热歌榜",
-                     page: int = 1) -> List[MediaInfo]:
-        """探索源数据接口：歌单-最热 / 排行榜-榜单列表"""
+                     page: int = 1):
+        """探索源数据接口：歌单-最热 / 排行榜-榜单列表
+
+        注意：前端 pluginApi 统一校验响应信封 {success, message, data}，
+        直接返回裸 list 会导致「服务器返回了无效响应」(invalid-envelope)。
+        """
         try:
             if cat == "歌单":
-                return self._hot_playlists(page)
-            return self._chart_songs(chart)
+                items = self._hot_playlists(page)
+            else:
+                items = self._chart_songs(chart)
+            return {"success": True, "message": "", "data": items}
         except Exception as e:
             logger.error(f"【LX音乐下载】探索源取数失败：{e}")
-            return []
+            return {"success": False, "message": str(e), "data": []}
 
     def _chart_songs(self, chart: str) -> List[MediaInfo]:
         """按榜单名取歌曲列表"""
