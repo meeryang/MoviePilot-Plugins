@@ -680,6 +680,7 @@ class LxMusicDownloader(_PluginBase):
                 album = t.get("album") or {}
                 out.append(MediaInfo(
                     type="音乐",
+                    media_source=MediaSource("lxmusic"),
                     title=t.get("name"),
                     mediaid_prefix="lxmusic",
                     media_id=str(t.get("id")),
@@ -710,6 +711,7 @@ class LxMusicDownloader(_PluginBase):
                 album = d.get("albummid") or ""
                 out.append(MediaInfo(
                     type="音乐",
+                    media_source=MediaSource("lxmusic"),
                     title=d.get("songname"),
                     mediaid_prefix="lxmusic",
                     media_id=str(d.get("songmid") or ""),
@@ -738,6 +740,7 @@ class LxMusicDownloader(_PluginBase):
             for p in (r.json() or {}).get("playlists", []) or []:
                 out.append(MediaInfo(
                     type="音乐",
+                    media_source=MediaSource("lxmusic"),
                     title=p.get("name"),
                     mediaid_prefix="lxmusic",
                     media_id=str(p.get("id")),
