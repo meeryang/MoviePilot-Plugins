@@ -1,0 +1,93 @@
+{
+  "YtsIndexer": {
+    "name": "YTS索引器",
+    "description": "让 YTS（yts.torrentsbay.org / yts.gg）参与 MoviePilot 搜索与浏览",
+    "labels": "站点,搜索",
+    "version": "1.0.0",
+    "icon": "",
+    "author": "Hermes",
+    "level": 1,
+    "release": true,
+    "history": {
+      "v1.0.0": "初始版本"
+    }
+  },
+  "ProwlarrSitesIndexer": {
+    "name": "Prowlarr多站索引器",
+    "description": "把 Prowlarr 中的所有索引器通过 Torznab 接口接入 MoviePilot 搜索与浏览",
+    "labels": "站点,搜索",
+    "version": "1.0.0",
+    "icon": "",
+    "author": "虾虾",
+    "level": 1,
+    "release": true,
+    "history": {
+      "v1.0.0": "初始版本"
+    }
+  },
+  "ImdbSearch": {
+    "name": "IMDb搜索",
+    "description": "按关键词搜索 IMDb 影片，并可用 IMDb ID 精确搜索站点资源",
+    "labels": "搜索",
+    "version": "1.0.0",
+    "icon": "",
+    "author": "虾虾",
+    "level": 1,
+    "release": true,
+    "history": {
+      "v1.0.0": "初始版本"
+    }
+  },
+  "LxMusicDownloader": {
+    "name": "LX音乐下载",
+    "description": "订阅歌手/关键词，调用 lx-sync-server 自动搜索并缓存音乐，支持音质选择",
+    "labels": "音乐",
+    "version": "1.0",
+    "icon": "",
+    "author": "虾虾",
+    "level": 1,
+    "release": true,
+    "history": {
+      "v1.0": "初始版本"
+    }
+  },
+  "AniBTIndexer": {
+    "name": "AniBT索引器",
+    "description": "通过 AniBT 公开 RSS 实现搜索，让 AniBT 像普通站点一样可搜索/可订阅",
+    "labels": "站点,搜索",
+    "version": "1.0.0",
+    "icon": "",
+    "author": "hermes",
+    "level": 1,
+    "release": true,
+    "history": {
+      "v1.0.0": "初始版本"
+    }
+  },
+  "MikanIndexer": {
+    "name": "MiKan索引器",
+    "description": "通过 MiKan 公开 RSS 实现搜索，让 MiKan 像普通站点一样可搜索/可订阅",
+    "labels": "站点,搜索",
+    "version": "1.0.0",
+    "icon": "",
+    "author": "hermes",
+    "level": 1,
+    "release": true,
+    "history": {
+      "v1.0.0": "初始版本"
+    }
+  },
+  "NyaaIndexer": {
+    "name": "Nyaa索引器",
+    "description": "通过 Nyaa 公开 RSS 实现搜索，让 Nyaa 像普通站点一样可搜索/可订阅",
+    "labels": "站点,搜索",
+    "version": "1.0.0",
+    "icon": "",
+    "author": "hermes",
+    "level": 1,
+    "release": true,
+    "history": {
+      "v1.0.0": "初始版本"
+    }
+  }
+}
