@@ -19,11 +19,18 @@ MoviePilot 本身没有「音乐订阅」概念，本插件补上：
 - 音质由源直链决定，`quality` 参数只用于服务端缓存命名与去重
 """
 import time
+import json
 import requests
 from typing import List, Optional, Tuple
 
 from app.log import logger
 from app.plugins import _PluginBase
+
+# 探索源支持（v3）
+from app.core.event import eventmanager, Event
+from app.core.config import settings
+from app.schemas.types import ChainEventType, MediaSource
+from app.schemas import DiscoverSourceEventData, DiscoverMediaSource, MediaInfo
 
 
 # 音质档位：value -> 说明
@@ -40,6 +47,65 @@ URL_TEMPLATES = {
         "https://antiserver.kuwo.cn/anti.s?type=convert_url&format=aac&response=url&rid=MUSIC_{mid}",
     ],
 }
+
+# ═══════════════════════════════════════════════════════════
+# 探索源：歌单 / 排行榜
+# ═══════════════════════════════════════════════════════════
+
+# 网易云榜单 ID（官方固定 ID）
+NETEASE_CHARTS = {
+    "热歌榜": "3778678",
+    "飙升榜": "19723756",
+    "新歌榜": "3779629",
+    "原创榜": "2884035",
+}
+
+# QQ 音乐榜单 topid
+QQ_CHARTS = {
+    "热歌榜": "26",
+    "新歌榜": "27",
+    "内地榜": "58",
+    "港台榜": "59",
+    "欧美榜": "62",
+}
+
+# 探索分类
+LX_CATS = ["歌单", "排行榜"]
+
+
+def lx_filter_ui() -> List[dict]:
+    """探索面板的筛选 UI（分类 + 榜单）"""
+    cat_ui = [
+        {"component": "VChip", "props": {"filter": True, "tile": True, "value": c}, "text": c}
+        for c in LX_CATS
+    ]
+    chart_names = ([f"网易云·{k}" for k in NETEASE_CHARTS]
+                   + [f"QQ·{k}" for k in QQ_CHARTS])
+    chart_ui = [
+        {"component": "VChip", "props": {"filter": True, "tile": True, "value": c}, "text": c}
+        for c in chart_names
+    ]
+    return [
+        {
+            "component": "div",
+            "props": {"class": "flex justify-start items-center"},
+            "content": [
+                {"component": "div", "props": {"class": "mr-5"},
+                 "content": [{"component": "VLabel", "text": "分类"}]},
+                {"component": "VChipGroup", "props": {"model": "cat"}, "content": cat_ui},
+            ],
+        },
+        {
+            "component": "div",
+            "props": {"class": "flex justify-start items-center", "show": "{{cat == '排行榜'}}"},
+            "content": [
+                {"component": "div", "props": {"class": "mr-5"},
+                 "content": [{"component": "VLabel", "text": "榜单"}]},
+                {"component": "VChipGroup", "props": {"model": "chart"}, "content": chart_ui},
+            ],
+        },
+    ]
+
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
@@ -123,6 +189,13 @@ class LxMusicDownloader(_PluginBase):
                 "methods": ["GET", "POST"],
                 "summary": "按关键词批量下载",
                 "description": "搜索关键词取前 N 首下载",
+            },
+            {
+                "path": "/discover",
+                "endpoint": self.api_discover,
+                "methods": ["GET"],
+                "summary": "探索源数据",
+                "description": "歌单/排行榜 数据，供发现-探索-分类面板使用",
             },
             {
                 "path": "/test",
@@ -543,3 +616,135 @@ class LxMusicDownloader(_PluginBase):
             }
         except Exception as e:
             return {"success": False, "message": f"连接异常：{e}"}
+
+
+    # ═══════════════════════════════════════════════════════
+    # 功能1：探索源（发现-探索-分类面板）
+    # ═══════════════════════════════════════════════════════
+
+    @eventmanager.register(ChainEventType.DiscoverSource)
+    def discover_source(self, event: Event):
+        """向「发现-探索-分类」面板注册 LX音乐 数据源"""
+        try:
+            if not self._enabled:
+                return
+            event_data: DiscoverSourceEventData = event.event_data
+            src = DiscoverMediaSource(
+                name="LX音乐",
+                media_source=MediaSource("lxmusic"),
+                mediaid_prefix="lxmusic",
+                api_path=f"plugin/LxMusicDownloader/discover?apikey={settings.API_TOKEN}",
+                filter_params={"cat": "排行榜", "chart": "网易云·热歌榜"},
+                filter_ui=lx_filter_ui(),
+                depends={"chart": ["cat"]},
+            )
+            event_data.extra_sources.append(src)
+            logger.info("【LX音乐下载】✅ 已注册探索源：LX音乐")
+        except Exception as e:
+            logger.error(f"【LX音乐下载】注册探索源失败：{e}")
+
+    def api_discover(self, cat: str = "排行榜", chart: str = "网易云·热歌榜",
+                     page: int = 1) -> List[MediaInfo]:
+        """探索源数据接口：歌单-最热 / 排行榜-榜单列表"""
+        try:
+            if cat == "歌单":
+                return self._hot_playlists(page)
+            return self._chart_songs(chart)
+        except Exception as e:
+            logger.error(f"【LX音乐下载】探索源取数失败：{e}")
+            return []
+
+    def _chart_songs(self, chart: str) -> List[MediaInfo]:
+        """按榜单名取歌曲列表"""
+        out: List[MediaInfo] = []
+        if "·" not in chart:
+            return out
+        plat, name = chart.split("·", 1)
+        ua = {"User-Agent": UA}
+
+        if plat == "网易云":
+            cid = NETEASE_CHARTS.get(name)
+            if not cid:
+                return out
+            r = requests.get(
+                "https://music.163.com/api/playlist/detail",
+                params={"id": cid},
+                headers={**ua, "Referer": "https://music.163.com/"},
+                timeout=25,
+            )
+            if r.status_code != 200:
+                logger.warning(f"【LX音乐下载】网易云榜单 HTTP {r.status_code}")
+                return out
+            tracks = (r.json() or {}).get("result", {}).get("tracks", []) or []
+            for t in tracks:
+                album = t.get("album") or {}
+                out.append(MediaInfo(
+                    type="音乐",
+                    title=t.get("name"),
+                    mediaid_prefix="lxmusic",
+                    media_id=str(t.get("id")),
+                    poster_path=album.get("picUrl") or "",
+                    overview=" / ".join(a.get("name", "") for a in (t.get("artists") or [])),
+                ))
+            logger.info(f"【LX音乐下载】网易云·{name} 取到 {len(out)} 首")
+
+        elif plat == "QQ":
+            tid = QQ_CHARTS.get(name)
+            if not tid:
+                return out
+            r = requests.get(
+                "https://c.y.qq.com/v8/fcg-bin/fcg_v8_toplist_cp.fcg",
+                params={"topid": tid, "format": "json", "page": "detail", "type": "top"},
+                headers={**ua, "Referer": "https://y.qq.com/"},
+                timeout=25,
+            )
+            if r.status_code != 200:
+                logger.warning(f"【LX音乐下载】QQ榜单 HTTP {r.status_code}")
+                return out
+            txt = (r.text or "").strip()
+            if txt.startswith("callback("):
+                txt = txt[9:-1]
+            data = json.loads(txt)
+            for item in data.get("songlist", []) or []:
+                d = item.get("data") or {}
+                album = d.get("albummid") or ""
+                out.append(MediaInfo(
+                    type="音乐",
+                    title=d.get("songname"),
+                    mediaid_prefix="lxmusic",
+                    media_id=str(d.get("songmid") or ""),
+                    poster_path=(f"https://y.gtimg.cn/music/photo_new/T002R300x300M000{album}.jpg"
+                                 if album else ""),
+                    overview=" / ".join(s.get("name", "") for s in (d.get("singer") or [])),
+                ))
+            logger.info(f"【LX音乐下载】QQ·{name} 取到 {len(out)} 首")
+
+        return out
+
+    def _hot_playlists(self, page: int = 1) -> List[MediaInfo]:
+        """歌单-聚合-最热（网易云热门歌单）"""
+        out: List[MediaInfo] = []
+        try:
+            r = requests.get(
+                "https://music.163.com/api/playlist/list",
+                params={"cat": "全部", "order": "hot", "limit": 30,
+                        "offset": max(0, (page - 1) * 30)},
+                headers={"User-Agent": UA, "Referer": "https://music.163.com/"},
+                timeout=25,
+            )
+            if r.status_code != 200:
+                logger.warning(f"【LX音乐下载】热门歌单 HTTP {r.status_code}")
+                return out
+            for p in (r.json() or {}).get("playlists", []) or []:
+                out.append(MediaInfo(
+                    type="音乐",
+                    title=p.get("name"),
+                    mediaid_prefix="lxmusic",
+                    media_id=str(p.get("id")),
+                    poster_path=p.get("coverImgUrl") or "",
+                    overview=f"歌单 · {p.get('trackCount') or 0} 首 · 播放 {p.get('playCount') or 0}",
+                ))
+            logger.info(f"【LX音乐下载】热门歌单取到 {len(out)} 个")
+        except Exception as e:
+            logger.error(f"【LX音乐下载】热门歌单失败：{e}")
+        return out
