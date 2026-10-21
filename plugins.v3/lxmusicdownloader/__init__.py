@@ -20,17 +20,13 @@ MoviePilot 本身没有「音乐订阅」概念，本插件补上：
 """
 import time
 import json
+import re
 import requests
 from typing import List, Optional, Tuple
 
 from app.log import logger
 from app.plugins import _PluginBase
 
-# 探索源支持（v3）
-from app.core.event import eventmanager, Event
-from app.core.config import settings
-from app.schemas.types import ChainEventType, MediaSource
-from app.schemas import DiscoverSourceEventData, DiscoverMediaSource, MediaInfo
 
 
 # 音质档位：value -> 说明
@@ -38,6 +34,14 @@ QUALITY_CHOICES = [
     {"title": "FLAC 无损（体积大、最慢）", "value": "flac"},
     {"title": "320k 高音质（推荐，默认）", "value": "320k"},
     {"title": "128k 标准（体积小）", "value": "128k"},
+]
+
+# 专辑搜索源顺序
+ALBUM_ORDER_CHOICES = [
+    {"title": "网易云 → QQ（推荐）", "value": "netease,qq"},
+    {"title": "QQ → 网易云", "value": "qq,netease"},
+    {"title": "仅网易云", "value": "netease"},
+    {"title": "仅 QQ", "value": "qq"},
 ]
 
 # 各音源取直链的 url 模板（{mid} 会替换成 songmid）
@@ -48,65 +52,6 @@ URL_TEMPLATES = {
     ],
 }
 
-# ═══════════════════════════════════════════════════════════
-# 探索源：歌单 / 排行榜
-# ═══════════════════════════════════════════════════════════
-
-# 网易云榜单 ID（官方固定 ID）
-NETEASE_CHARTS = {
-    "热歌榜": "3778678",
-    "飙升榜": "19723756",
-    "新歌榜": "3779629",
-    "原创榜": "2884035",
-}
-
-# QQ 音乐榜单 topid
-QQ_CHARTS = {
-    "热歌榜": "26",
-    "新歌榜": "27",
-    "内地榜": "58",
-    "港台榜": "59",
-    "欧美榜": "62",
-}
-
-# 探索分类
-LX_CATS = ["歌单", "排行榜"]
-
-
-def lx_filter_ui() -> List[dict]:
-    """探索面板的筛选 UI（分类 + 榜单）"""
-    cat_ui = [
-        {"component": "VChip", "props": {"filter": True, "tile": True, "value": c}, "text": c}
-        for c in LX_CATS
-    ]
-    chart_names = ([f"网易云·{k}" for k in NETEASE_CHARTS]
-                   + [f"QQ·{k}" for k in QQ_CHARTS])
-    chart_ui = [
-        {"component": "VChip", "props": {"filter": True, "tile": True, "value": c}, "text": c}
-        for c in chart_names
-    ]
-    return [
-        {
-            "component": "div",
-            "props": {"class": "flex justify-start items-center"},
-            "content": [
-                {"component": "div", "props": {"class": "mr-5"},
-                 "content": [{"component": "VLabel", "text": "分类"}]},
-                {"component": "VChipGroup", "props": {"model": "cat"}, "content": cat_ui},
-            ],
-        },
-        {
-            "component": "div",
-            "props": {"class": "flex justify-start items-center", "show": "{{cat == '排行榜'}}"},
-            "content": [
-                {"component": "div", "props": {"class": "mr-5"},
-                 "content": [{"component": "VLabel", "text": "榜单"}]},
-                {"component": "VChipGroup", "props": {"model": "chart"}, "content": chart_ui},
-            ],
-        },
-    ]
-
-
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
 
@@ -114,9 +59,9 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 class LxMusicDownloader(_PluginBase):
     # 插件元信息
     plugin_name = "LX音乐下载"
-    plugin_desc = "订阅歌手/关键词，调用 lx-sync-server 自动搜索并缓存音乐，支持音质选择"
+    plugin_desc = "音乐专辑订阅联动：订阅-音乐新增专辑时按网易云/QQ 搜索整张专辑并经 LX音乐下载；支持音质选择"
     plugin_icon = "https://gitee.com/makimayang/obsidian/raw/main/icon.png"
-    plugin_version = "1.0"
+    plugin_version = "2.0"
     plugin_author = "虾虾"
     author_url = ""
     plugin_config_prefix = "lxmusicdownloader_"
@@ -151,12 +96,18 @@ class LxMusicDownloader(_PluginBase):
         self._limit = int(config.get("limit") or 10)
         self._notify = bool(config.get("notify", True))
         self._only_new = bool(config.get("only_new", True))
+        # 音乐专辑订阅联动
+        self._music_sub = bool(config.get("music_sub", True))
+        # 专辑搜索源顺序，默认网易云优先
+        self._album_order = (config.get("album_order") or "netease,qq").strip()
 
-        if self._enabled and self._subscribes.strip():
-            # 每 6 小时跑一次订阅检查
+        need_loop = self._enabled and (self._subscribes.strip() or self._music_sub)
+        if need_loop:
             self.save_data("done", self._done)
-            logger.info(f"【{self.plugin_name}】订阅检查已排程，歌手/关键词：{self._subscribes}")
-            # MoviePilot 的定时任务通过 post_message 之外的方式注册，这里用后台线程兜底
+            logger.info(
+                f"【{self.plugin_name}】后台检查已排程 | 关键词订阅：{bool(self._subscribes.strip())} "
+                f"| 音乐专辑订阅：{self._music_sub} | 音质：{self._quality}"
+            )
             import threading
             threading.Thread(target=self._loop, daemon=True, name="lxmusic-subscribe").start()
 
@@ -191,11 +142,18 @@ class LxMusicDownloader(_PluginBase):
                 "description": "搜索关键词取前 N 首下载",
             },
             {
-                "path": "/discover",
-                "endpoint": self.api_discover,
+                "path": "/album_search",
+                "endpoint": self.api_album_search,
                 "methods": ["GET"],
-                "summary": "探索源数据",
-                "description": "歌单/排行榜 数据，供发现-探索-分类面板使用",
+                "summary": "专辑搜索测试",
+                "description": "按专辑名依次调用网易云/QQ 搜索专辑并列出曲目",
+            },
+            {
+                "path": "/music_subs",
+                "endpoint": self.api_music_subs,
+                "methods": ["GET"],
+                "summary": "音乐订阅联动状态",
+                "description": "查看已识别的音乐专辑订阅与处理记录",
             },
             {
                 "path": "/test",
@@ -293,6 +251,40 @@ class LxMusicDownloader(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "music_sub",
+                                            "label": "音乐专辑订阅联动",
+                                            "hint": "订阅-音乐 新增专辑时，按顺序用网易云/QQ 搜索整张专辑并逐曲下载",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSelect",
+                                        "props": {
+                                            "model": "album_order",
+                                            "label": "专辑搜索顺序",
+                                            "items": ALBUM_ORDER_CHOICES,
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
                                 "props": {"cols": 12},
                                 "content": [
                                     {
@@ -363,6 +355,8 @@ class LxMusicDownloader(_PluginBase):
             "only_new": True,
             "server_url": "http://127.0.0.1:8142",
             "quality": "320k",
+                "music_sub": True,
+                "album_order": "netease,qq",
             "token": "",
             "subscribes": "",
             "limit": 10,
@@ -528,15 +522,23 @@ class LxMusicDownloader(_PluginBase):
     # 订阅循环
     # ------------------------------------------------------------------ #
     def _loop(self):
-        # 启动后先等 60 秒，避免和主程序启动抢资源
-        time.sleep(60)
+        # 启动后先等 45 秒，避免和主程序启动抢资源
+        time.sleep(45)
+        keyword_tick = 0
         while True:
             try:
-                if self._enabled and self._subscribes.strip():
+                if self._enabled and self._music_sub:
+                    self.music_subscribe_check()
+            except Exception as e:
+                logger.error(f"【{self.plugin_name}】音乐订阅检查异常：{e}")
+            # 关键词订阅较重，6 小时一次
+            try:
+                if self._enabled and self._subscribes.strip() and keyword_tick % 24 == 0:
                     self.subscribe_check()
             except Exception as e:
-                logger.error(f"【{self.plugin_name}】订阅循环异常：{e}")
-            time.sleep(6 * 3600)  # 6 小时
+                logger.error(f"【{self.plugin_name}】关键词订阅异常：{e}")
+            keyword_tick += 1
+            time.sleep(15 * 60)  # 15 分钟一轮
 
     def subscribe_check(self):
         """逐个订阅关键词检查并下载新歌"""
@@ -618,142 +620,348 @@ class LxMusicDownloader(_PluginBase):
             return {"success": False, "message": f"连接异常：{e}"}
 
 
-    # ═══════════════════════════════════════════════════════
-    # 功能1：探索源（发现-探索-分类面板）
-    # ═══════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════
+    # 音乐专辑订阅联动：MoviePilot 订阅-音乐 新增专辑 → 网易云/QQ 搜专辑 → 下载
+    # ═══════════════════════════════════════════════════════════════
 
-    @eventmanager.register(ChainEventType.DiscoverSource)
-    def discover_source(self, event: Event):
-        """向「发现-探索-分类」面板注册 LX音乐 数据源"""
+    def _h5(self) -> dict:
+        """浏览器 UA，第三方接口必需"""
+        return {"User-Agent": UA}
+
+    @staticmethod
+    def _norm(s: str) -> str:
+        """归一化专辑名用于比对：去空格、括号内容、标点，转小写"""
+        if not s:
+            return ""
+        t = str(s).lower()
+        t = re.sub(r"[（(\[【].*?[）)\]】]", "", t)
+        t = re.sub(r"[\s\-_·．.,，。!！?？'\"”“:：;；/\\|&+]", "", t)
+        return t.strip()
+
+    # ---------------- 网易云 ----------------
+
+    def _album_search_netease(self, keyword: str) -> Optional[dict]:
+        """网易云专辑搜索，返回最佳匹配 {id,name,artist,size}"""
         try:
-            if not self._enabled:
-                return
-            event_data: DiscoverSourceEventData = event.event_data
-            src = DiscoverMediaSource(
-                name="LX音乐",
-                media_source=MediaSource("lxmusic"),
-                mediaid_prefix="lxmusic",
-                api_path=f"plugin/LxMusicDownloader/discover?apikey={settings.API_TOKEN}",
-                filter_params={"cat": "排行榜", "chart": "网易云·热歌榜"},
-                filter_ui=lx_filter_ui(),
-                depends={"chart": ["cat"]},
+            r = requests.get(
+                "https://music.163.com/api/search/get",
+                params={"s": keyword, "type": 10, "limit": 20, "offset": 0},
+                headers={**self._h5(), "Referer": "https://music.163.com/",
+                         "Cookie": "appver=2.0.2; os=pc"},
+                timeout=25,
             )
-            event_data.extra_sources.append(src)
-            logger.info("【LX音乐下载】✅ 已注册探索源：LX音乐")
+            if r.status_code != 200:
+                logger.warning(f"【LX音乐下载】网易云专辑搜索 HTTP {r.status_code}")
+                return None
+            albums = ((r.json() or {}).get("result") or {}).get("albums") or []
+            if not albums:
+                return None
+            want = self._norm(keyword)
+            best, best_score = None, 0.0
+            for a in albums:
+                name = a.get("name") or ""
+                artist = ((a.get("artist") or {}).get("name")) or ""
+                size = a.get("size") or 0
+                nm = self._norm(name)
+                if not nm or nm not in want:
+                    continue
+                score = 0.55 if nm == want else 0.40
+                if artist:
+                    if self._norm(artist) in want:
+                        score += 0.30
+                else:
+                    score -= 0.15
+                if size:
+                    score += min(int(size), 30) / 300.0
+                if score > best_score:
+                    best_score, best = score, {
+                        "id": a.get("id"), "name": name, "artist": artist, "size": size,
+                    }
+            if best and best_score >= 0.5:
+                logger.info(f"【LX音乐下载】网易云命中专辑：{best['name']} / {best['artist']} ({best['size']} 首)")
+                return best
+            return None
         except Exception as e:
-            logger.error(f"【LX音乐下载】注册探索源失败：{e}")
+            logger.warning(f"【LX音乐下载】网易云专辑搜索异常：{e}")
+            return None
 
-    def api_discover(self, cat: str = "排行榜", chart: str = "网易云·热歌榜",
-                     page: int = 1):
-        """探索源数据接口：歌单-最热 / 排行榜-榜单列表
+    def _album_tracks_netease(self, album_id) -> List[dict]:
+        """网易云专辑曲目列表 [{name, artist}]
 
-        注意：前端 pluginApi 统一校验响应信封 {success, message, data}，
-        直接返回裸 list 会导致「服务器返回了无效响应」(invalid-envelope)。
+        注意：/api/album/{id} 在无 Cookie 时返回 code=-462（反爬），
+        必须带基础 Cookie，或改用 /api/v1/album/{id}。
         """
+        hdr = {**self._h5(), "Referer": "https://music.163.com/",
+               "Cookie": "appver=2.0.2; os=pc"}
+        for url in (f"https://music.163.com/api/v1/album/{album_id}",
+                    f"https://music.163.com/api/album/{album_id}"):
+            try:
+                r = requests.get(url, headers=hdr, timeout=25)
+                if r.status_code != 200:
+                    continue
+                j = r.json() or {}
+                songs = j.get("songs") or ((j.get("album") or {}).get("songs")) or []
+                if not songs:
+                    logger.warning(f"【LX音乐下载】网易云专辑 {album_id} 无曲目（code={j.get('code')}）")
+                    continue
+                out = []
+                for s in songs:
+                    ar = s.get("artists") or s.get("ar") or []
+                    artists = "/".join(a.get("name", "") for a in ar if isinstance(a, dict))
+                    out.append({"name": s.get("name") or "", "artist": artists})
+                out = [x for x in out if x["name"]]
+                if out:
+                    return out
+            except Exception as e:
+                logger.warning(f"【LX音乐下载】网易云专辑详情异常：{e}")
+        return []
+
+    # ---------------- QQ 音乐 ----------------
+
+    def _album_search_qq(self, keyword: str) -> Optional[dict]:
+        """QQ 音乐专辑搜索，返回最佳匹配 {mid,name,artist,size}"""
         try:
-            if cat == "歌单":
-                items = self._hot_playlists(page)
-            else:
-                items = self._chart_songs(chart)
-            return {"success": True, "message": "", "data": items}
-        except Exception as e:
-            logger.error(f"【LX音乐下载】探索源取数失败：{e}")
-            return {"success": False, "message": str(e), "data": []}
-
-    def _chart_songs(self, chart: str) -> List[MediaInfo]:
-        """按榜单名取歌曲列表"""
-        out: List[MediaInfo] = []
-        if "·" not in chart:
-            return out
-        plat, name = chart.split("·", 1)
-        ua = {"User-Agent": UA}
-
-        if plat == "网易云":
-            cid = NETEASE_CHARTS.get(name)
-            if not cid:
-                return out
             r = requests.get(
-                "https://music.163.com/api/playlist/detail",
-                params={"id": cid},
-                headers={**ua, "Referer": "https://music.163.com/"},
+                "https://c.y.qq.com/soso/fcgi-bin/client_search_cp",
+                params={"w": keyword, "t": "8", "format": "json", "p": 1, "n": 20},
+                headers={**self._h5(), "Referer": "https://y.qq.com/"},
                 timeout=25,
             )
             if r.status_code != 200:
-                logger.warning(f"【LX音乐下载】网易云榜单 HTTP {r.status_code}")
-                return out
-            tracks = (r.json() or {}).get("result", {}).get("tracks", []) or []
-            for t in tracks:
-                album = t.get("album") or {}
-                out.append(MediaInfo(
-                    type="音乐",
-                    media_source=MediaSource("lxmusic"),
-                    title=t.get("name"),
-                    mediaid_prefix="lxmusic",
-                    media_id=str(t.get("id")),
-                    poster_path=album.get("picUrl") or "",
-                    overview=" / ".join(a.get("name", "") for a in (t.get("artists") or [])),
-                ))
-            logger.info(f"【LX音乐下载】网易云·{name} 取到 {len(out)} 首")
-
-        elif plat == "QQ":
-            tid = QQ_CHARTS.get(name)
-            if not tid:
-                return out
-            r = requests.get(
-                "https://c.y.qq.com/v8/fcg-bin/fcg_v8_toplist_cp.fcg",
-                params={"topid": tid, "format": "json", "page": "detail", "type": "top"},
-                headers={**ua, "Referer": "https://y.qq.com/"},
-                timeout=25,
-            )
-            if r.status_code != 200:
-                logger.warning(f"【LX音乐下载】QQ榜单 HTTP {r.status_code}")
-                return out
+                logger.warning(f"【LX音乐下载】QQ专辑搜索 HTTP {r.status_code}")
+                return None
             txt = (r.text or "").strip()
             if txt.startswith("callback("):
                 txt = txt[9:-1]
             data = json.loads(txt)
-            for item in data.get("songlist", []) or []:
-                d = item.get("data") or {}
-                album = d.get("albummid") or ""
-                out.append(MediaInfo(
-                    type="音乐",
-                    media_source=MediaSource("lxmusic"),
-                    title=d.get("songname"),
-                    mediaid_prefix="lxmusic",
-                    media_id=str(d.get("songmid") or ""),
-                    poster_path=(f"https://y.gtimg.cn/music/photo_new/T002R300x300M000{album}.jpg"
-                                 if album else ""),
-                    overview=" / ".join(s.get("name", "") for s in (d.get("singer") or [])),
-                ))
-            logger.info(f"【LX音乐下载】QQ·{name} 取到 {len(out)} 首")
+            albums = ((((data.get("data") or {}).get("album") or {}).get("list"))) or []
+            if not albums:
+                return None
+            want = self._norm(keyword)
+            best, best_score = None, 0.0
+            for a in albums:
+                name = a.get("albumName") or ""
+                # 歌手字段：顶层 singerName 最可靠，其次 singer_list[].name（不是 singerName）
+                artist = a.get("singerName") or ""
+                if not artist:
+                    sl = a.get("singer_list") or []
+                    artist = "/".join(s.get("name", "") for s in sl if isinstance(s, dict))
+                size = a.get("song_count") or 0
+                nm = self._norm(name)
+                if not nm or nm not in want:
+                    continue
+                score = 0.55 if nm == want else 0.40
+                if artist:
+                    if self._norm(artist) in want:
+                        score += 0.30
+                else:
+                    score -= 0.15
+                if size:
+                    score += min(int(size), 30) / 300.0
+                if score > best_score:
+                    best_score, best = score, {
+                        "mid": a.get("albumMID"), "name": name, "artist": artist, "size": size,
+                    }
+            if best and best_score >= 0.5:
+                logger.info(f"【LX音乐下载】QQ 命中专辑：{best['name']} / {best['artist']}")
+                return best
+            return None
+        except Exception as e:
+            logger.warning(f"【LX音乐下载】QQ专辑搜索异常：{e}")
+            return None
 
-        return out
-
-    def _hot_playlists(self, page: int = 1) -> List[MediaInfo]:
-        """歌单-聚合-最热（网易云热门歌单）"""
-        out: List[MediaInfo] = []
+    def _album_tracks_qq(self, album_mid: str) -> List[dict]:
+        """QQ 专辑曲目列表 [{name, artist}]"""
         try:
             r = requests.get(
-                "https://music.163.com/api/playlist/list",
-                params={"cat": "全部", "order": "hot", "limit": 30,
-                        "offset": max(0, (page - 1) * 30)},
-                headers={"User-Agent": UA, "Referer": "https://music.163.com/"},
+                "https://c.y.qq.com/v8/fcg-bin/fcg_v8_album_info_cp.fcg",
+                params={"albummid": album_mid, "format": "json"},
+                headers={**self._h5(), "Referer": "https://y.qq.com/"},
                 timeout=25,
             )
             if r.status_code != 200:
-                logger.warning(f"【LX音乐下载】热门歌单 HTTP {r.status_code}")
-                return out
-            for p in (r.json() or {}).get("playlists", []) or []:
-                out.append(MediaInfo(
-                    type="音乐",
-                    media_source=MediaSource("lxmusic"),
-                    title=p.get("name"),
-                    mediaid_prefix="lxmusic",
-                    media_id=str(p.get("id")),
-                    poster_path=p.get("coverImgUrl") or "",
-                    overview=f"歌单 · {p.get('trackCount') or 0} 首 · 播放 {p.get('playCount') or 0}",
-                ))
-            logger.info(f"【LX音乐下载】热门歌单取到 {len(out)} 个")
+                return []
+            txt = (r.text or "").strip()
+            if txt.startswith("callback("):
+                txt = txt[9:-1]
+            data = json.loads(txt)
+            lst = (data.get("data") or {}).get("list") or []
+            out = []
+            for s in lst:
+                singers = s.get("singer") or []
+                artist = "/".join((x.get("name") or x.get("singerName") or "")
+                                  for x in singers if isinstance(x, dict))
+                out.append({"name": s.get("songname") or "", "artist": artist})
+            return [x for x in out if x["name"]]
         except Exception as e:
-            logger.error(f"【LX音乐下载】热门歌单失败：{e}")
-        return out
+            logger.warning(f"【LX音乐下载】QQ专辑详情异常：{e}")
+            return []
+
+    # ---------------- 主流程 ----------------
+
+    def find_album(self, album_name: str, expect_tracks: Optional[int] = None
+                   ) -> Tuple[Optional[str], str, List[dict]]:
+        """依次按配置顺序搜索专辑，返回 (来源, 专辑名, 曲目列表)"""
+        order = [x.strip().lower() for x in (self._album_order or "netease,qq").split(",") if x.strip()]
+        if not order:
+            order = ["netease", "qq"]
+        for src in order:
+            if src == "netease":
+                hit = self._album_search_netease(album_name)
+                if hit and hit.get("id"):
+                    tracks = self._album_tracks_netease(hit["id"])
+                    if tracks and self._tracks_ok(tracks, expect_tracks):
+                        return "netease", hit.get("name") or album_name, tracks
+            elif src == "qq":
+                hit = self._album_search_qq(album_name)
+                if hit and hit.get("mid"):
+                    tracks = self._album_tracks_qq(hit["mid"])
+                    if tracks and self._tracks_ok(tracks, expect_tracks):
+                        return "qq", hit.get("name") or album_name, tracks
+        return None, album_name, []
+
+    @staticmethod
+    def _tracks_ok(tracks: List[dict], expect: Optional[int]) -> bool:
+        """有预期曲目数时，允许 ±2 的误差，否则放行"""
+        if not expect or expect <= 0:
+            return True
+        return abs(len(tracks) - int(expect)) <= 2
+
+    def download_album(self, album_name: str, expect_tracks: Optional[int] = None
+                       ) -> Tuple[bool, str]:
+        """搜索整张专辑并逐曲下载，返回 (是否成功, 说明)"""
+        err = self._check_conf()
+        if err:
+            return False, err
+        src, real_name, tracks = self.find_album(album_name, expect_tracks)
+        if not tracks:
+            return False, f"网易云/QQ 均未找到专辑「{album_name}」"
+        logger.info(f"【LX音乐下载】专辑「{real_name}」来自 {src}，共 {len(tracks)} 首，开始下载（音质 {self._quality}）")
+        ok_cnt, skip_cnt = 0, 0
+        for t in tracks:
+            kw = f"{t['name']} {t['artist']}".strip()
+            songs = self.search(kw, limit=3)
+            if not songs:
+                logger.warning(f"【LX音乐下载】LX服务端未搜到：{kw}")
+                skip_cnt += 1
+                time.sleep(1)
+                continue
+            # 优先同名曲目
+            pick = None
+            for s in songs:
+                if self._norm(s.get("name") or "") == self._norm(t["name"]):
+                    pick = s
+                    break
+            pick = pick or songs[0]
+            if self.download(pick):
+                ok_cnt += 1
+            else:
+                skip_cnt += 1
+            time.sleep(1)
+        msg = f"专辑「{real_name}」（{src}）共 {len(tracks)} 首，成功 {ok_cnt}，跳过/失败 {skip_cnt}"
+        logger.info(f"【LX音乐下载】✅ {msg}")
+        return (ok_cnt > 0), msg
+
+    def music_subscribe_check(self):
+        """扫描 MoviePilot 音乐专辑订阅，新订阅的自动整张下载"""
+        try:
+            from app.db.oper.subscribe import SubscribeOper
+        except Exception as e:
+            logger.error(f"【LX音乐下载】无法导入 SubscribeOper：{e}")
+            return
+        try:
+            subs = SubscribeOper().list() or []
+        except Exception as e:
+            logger.error(f"【LX音乐下载】读取订阅失败：{e}")
+            return
+
+        albums = []
+        for s in subs:
+            if (getattr(s, "type", None) or "") != "音乐":
+                continue
+            mt = getattr(s, "music_type", None)
+            if mt and mt != "album":
+                continue
+            sid = getattr(s, "id", None)
+            nm = getattr(s, "name", None)
+            if sid is None or not nm:
+                continue
+            albums.append({"id": int(sid), "name": nm,
+                           "total_tracks": getattr(s, "total_tracks", None)})
+
+        state = self.get_data("music_subs") or {}
+        baseline = state.get("baseline")
+        processed = state.get("processed") or {}
+
+        # 首次运行只建基线，不回溯下载历史订阅
+        if baseline is None:
+            self.save_data("music_subs", {"baseline": [a["id"] for a in albums], "processed": {}})
+            logger.info(f"【LX音乐下载】音乐专辑订阅基线已建立：{len(albums)} 条（历史订阅不回溯）")
+            return
+
+        base_set = set(baseline)
+        targets = [a for a in albums
+                   if a["id"] not in base_set and str(a["id"]) not in processed]
+        if not targets:
+            return
+
+        logger.info(f"【LX音乐下载】发现 {len(targets)} 个新增音乐专辑订阅")
+        for a in targets:
+            try:
+                ok, msg = self.download_album(a["name"], a.get("total_tracks"))
+            except Exception as e:
+                ok, msg = False, f"异常：{e}"
+            processed[str(a["id"])] = {
+                "name": a["name"], "ok": ok, "msg": msg,
+                "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            self.save_data("music_subs", {"baseline": baseline, "processed": processed})
+            if self._notify:
+                try:
+                    self.post_message(
+                        title=f"{'✅' if ok else '⚠️'} LX音乐 · 专辑订阅",
+                        text=f"{msg}\n音质：{self._quality}",
+                    )
+                except Exception:
+                    pass
+            time.sleep(2)
+
+    # ---------------- API 端点实现 ----------------
+
+    def api_album_search(self, keyword: str = "", download: bool = False):
+        """专辑搜索测试：列出网易云/QQ 命中的曲目"""
+        if not keyword:
+            return {"success": False, "message": "请提供 keyword（专辑名，可带歌手）"}
+        try:
+            src, real, tracks = self.find_album(keyword)
+        except Exception as e:
+            return {"success": False, "message": f"搜索异常：{e}"}
+        if not tracks:
+            return {"success": False, "message": "网易云/QQ 均未找到该专辑",
+                    "order": self._album_order}
+        result = {
+            "success": True,
+            "source": src,
+            "album": real,
+            "track_count": len(tracks),
+            "quality": self._quality,
+            "tracks": tracks[:50],
+        }
+        if download:
+            ok, msg = self.download_album(keyword)
+            result["download"] = {"ok": ok, "message": msg}
+        return result
+
+    def api_music_subs(self):
+        """查看音乐订阅联动状态"""
+        state = self.get_data("music_subs") or {}
+        processed = state.get("processed") or {}
+        return {
+            "enabled": self._enabled,
+            "music_subscribe": self._music_sub,
+            "quality": self._quality,
+            "album_order": self._album_order,
+            "baseline_count": len(state.get("baseline") or []),
+            "processed_count": len(processed),
+            "processed": processed,
+        }
