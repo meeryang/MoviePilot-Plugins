@@ -70,7 +70,7 @@ class LxMusicDownloader(_PluginBase):
     plugin_name = "LX音乐下载"
     plugin_desc = "音乐专辑订阅联动：订阅-音乐新增专辑时按网易云/QQ 搜索整张专辑并经 LX音乐下载；支持音质选择"
     plugin_icon = "https://gitee.com/makimayang/obsidian/raw/main/icon.png"
-    plugin_version = "3.0"
+    plugin_version = "3.1"
     plugin_author = "虾虾"
     author_url = ""
     plugin_config_prefix = "lxmusicdownloader_"
@@ -1564,8 +1564,11 @@ class LxMusicDownloader(_PluginBase):
                 ok, msg = self.download_album(a["name"], a.get("total_tracks"), artist=artist)
             except Exception as e:
                 ok, msg = False, f"异常：{e}"
+            # 修复：此处作用域没有 keyword 变量（那是 search() 的参数），
+            # 之前直接引用会导致 NameError，使下载已完成后仍报「运行失败」且记录不落库
+            _kw = f"{a['name']} {artist}".strip() if artist else a["name"]
             processed[str(a["id"])] = {
-                "name": a["name"], "artist": artist, "keyword": keyword,
+                "name": a["name"], "artist": artist, "keyword": _kw,
                 "ok": ok, "msg": msg,
                 "at": time.strftime("%Y-%m-%d %H:%M:%S"),
             }
