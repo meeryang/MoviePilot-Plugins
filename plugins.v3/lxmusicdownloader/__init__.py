@@ -70,7 +70,7 @@ class LxMusicDownloader(_PluginBase):
     plugin_name = "LX音乐下载"
     plugin_desc = "音乐专辑订阅联动：订阅-音乐新增专辑时按网易云/QQ 搜索整张专辑并经 LX音乐下载；支持音质选择"
     plugin_icon = "https://gitee.com/makimayang/obsidian/raw/main/icon.png"
-    plugin_version = "3.1"
+    plugin_version = "3.4"
     plugin_author = "虾虾"
     author_url = ""
     plugin_config_prefix = "lxmusicdownloader_"
@@ -772,13 +772,26 @@ class LxMusicDownloader(_PluginBase):
 
     @staticmethod
     def _norm(s: str) -> str:
-        """归一化专辑名用于比对：去空格、括号内容、标点，转小写"""
+        """归一化用于比对：去空格、标点、括号内容，转小写。
+        【重要】保留 Explicit/Clean 等版本标记，避免把「露骨版」和「干净版」误判为同一首。
+        """
         if not s:
             return ""
         t = str(s).lower()
+        # 先把需要在归一化后保留的标记抽出来
+        keep = []
+        for flag in ("explicit", "clean", "dirty", "uncensored", "slowed", "reverb",
+                     "sped up", "speed up", "nightcore", "8d", "bassboost", "bass boosted"):
+            pat = flag.replace(" ", " *")
+            if re.search("[（(\\[【]? *(?:%s) *[）)\\]】]?" % pat, t):
+                keep.append(flag.replace(" ", ""))
+        # 再删除所有括号内容（不影响已抽取的标记）
         t = re.sub(r"[（(\[【].*?[）)\]】]", "", t)
         t = re.sub(r"[\s\-_·．.,，。!！?？'\"”“:：;；/\\|&+]", "", t)
-        return t.strip()
+        t = t.strip()
+        if keep:
+            t += "|" + "|".join(sorted(keep))
+        return t
 
 
     def _mb_artist(self, mbid: str) -> str:
@@ -1379,65 +1392,212 @@ class LxMusicDownloader(_PluginBase):
             return removed, f"已删除 {removed} 个小于 {kb}KB 的文件"
         return 0, f"发现 {len(names)} 个小文件但删除失败（路径可能不匹配）"
 
-    def promote_to_music(self) -> Tuple[int, int, str]:
-        """把缓存目录里的歌搬进音乐库（/server/music，即「本地音乐」），
-        同一首歌只保留最高音质，低音质版本不搬。
-        返回 (搬移成功的数量, 被跳过的低音质数量, 说明)
-        """
-        items = self.cache_list("cache")
-        if not items:
-            return 0, 0, "缓存目录没有待搬移的文件"
+    _VERSION_WORDS = ("live", "remix", "instrumental", "acoustic", "cover", "demo",
+                      "karaoke", "off vocal", "inst", "现场", "伴奏", "翻唱", "纯音乐",
+                      "演唱会", "remaster", "remastered", "extended", "edit",
+                      "slowed", "reverb", "sped up", "speed up", "nightcore", "8d",
+                      "bassboost", "bass boosted", "mega slowed", "super slowed",
+                      "降速", "加速", "混响")
 
-        # 按 歌名+歌手 分组
+    def _dedup_library(self) -> Tuple[int, int, str]:
+        """清理音乐库内部的历史遗留重复：同「歌名+歌手」只保留最高音质。
+        跳过：版本变体（Live/Slowed/Remix…）、同名不同专辑版本。
+        """
+        lib_items = self.cache_list("music")
+        if not lib_items:
+            return 0, 0, "音乐库为空"
+
+        def _rank(x):
+            return self._QUAL_RANK.get(self._real_quality(x), 0)
+
+        def _key(x):
+            return (self._norm(x.get("name") or ""), self._norm(x.get("singer") or ""))
+
         groups = {}
-        for it in items:
+        for it in lib_items:
+            fn = it.get("filename")
+            if fn:
+                groups.setdefault(_key(it), []).append(it)
+
+        to_del = []
+        kept_variants = 0
+        for key, lst in groups.items():
+            if len(lst) < 2:
+                continue
+            lst.sort(key=_rank, reverse=True)
+            best = lst[0]
+            lower = lst[1:]
+            # 版本变体保护
+            if any(self._is_version_variant(x.get("name") or "",
+                                            x.get("album") or "") for x in lst):
+                kept_variants += len(lst)
+                continue
+            # 同名不同专辑保护
+            best_rank = _rank(best)
+            top = [x for x in lst if _rank(x) == best_rank]
+            albums = {self._norm(x.get("album") or "") for x in top}
+            if len(top) > 1 and len(albums) > 1:
+                kept_variants += len(top)
+                lower = [x for x in lst if _rank(x) < best_rank]
+            to_del.extend(x["filename"] for x in lower)
+
+        cleaned = 0
+        if to_del and self._lx_admin_pwd:
+            try:
+                r = requests.post(f"{self._server_url}/api/music/cache/remove",
+                                  params={"token": self._token},
+                                  json={"filenames": to_del},
+                                  headers={"Content-Type": "application/json",
+                                           "x-frontend-auth": self._lx_admin_pwd,
+                                           **self._headers()},
+                                  timeout=180)
+                if r.status_code in (200, 409):
+                    cleaned = int((r.json() or {}).get("deletedCount") or 0)
+                    logger.info(f"【{self.plugin_name}】库内去重清理 {cleaned} 个文件")
+            except Exception as e:
+                logger.warning(f"【{self.plugin_name}】库内去重失败：{e}")
+
+        msg = f"音乐库内去重：清理 {cleaned} 个重复" if cleaned else "音乐库内无重复"
+        if kept_variants:
+            msg += f"，保留 {kept_variants} 个版本变体"
+        return 0, cleaned, msg
+
+    _FN_QUAL_ORDER = ("flac24bit", "hires", "master", "flac", "320k", "192k", "128k")
+
+    def _real_quality(self, it: dict) -> str:
+        """推断真实音质：文件名里的标记比 quality 字段更可信。
+        服务端有时把实际 flac 文件标成 128k（字段解析错误），会导致去重排序失真。"""
+        fn = str(it.get("filename") or "").lower()
+        for mark in self._FN_QUAL_ORDER:
+            if mark in fn:
+                return mark
+        return str(it.get("quality") or "").lower()
+
+    def _is_version_variant(self, name: str, album: str) -> bool:
+        """判断是否是同一首歌的不同版本（Live/Remix/伴奏等），这类不做去重"""
+        t = f"{name or ''} {album or ''}".lower()
+        return any(w in t for w in self._VERSION_WORDS)
+
+    def promote_to_music(self) -> Tuple[int, int, str]:
+        """把缓存目录里的歌搬进音乐库（/server/music，即「本地音乐」）。
+        【核心去重逻辑】同时比对音乐库已有内容：
+          - 音乐库已有同等或更高音质 → 不搬，删除缓存副本
+          - 缓存音质更高 → 删除音乐库旧版，搬入新版
+          - 音乐库没有 → 正常搬入
+          - Live/Remix/伴奏等版本变体 → 一律保留，不视为重复
+        返回 (搬移成功的数量, 被清理的重复数量, 说明)
+        """
+        cache_items = self.cache_list("cache")
+        if not cache_items:
+            # 缓存已清空，但音乐库内部仍可能有历史遗留重复 → 做库内去重
+            return self._dedup_library()
+        lib_items = self.cache_list("music")   # ← 关键：读取音乐库已有内容
+
+        def _rank(x):
+            return self._QUAL_RANK.get(self._real_quality(x), 0)
+
+        def _key(x):
+            return (self._norm(x.get("name") or ""), self._norm(x.get("singer") or ""))
+
+        # 音乐库索引
+        lib_index = {}
+        for it in lib_items:
+            fn = it.get("filename")
+            if fn:
+                lib_index.setdefault(_key(it), []).append(it)
+
+        # 缓存分组
+        cache_groups = {}
+        for it in cache_items:
             fn = it.get("filename")
             if not fn:
                 continue
-            key = (self._norm(it.get("name") or ""), self._norm(it.get("singer") or ""))
-            groups.setdefault(key, []).append(it)
+            cache_groups.setdefault(_key(it), []).append(it)
 
-        to_move, low_quality = [], []
-        for key, lst in groups.items():
-            lst.sort(key=lambda x: self._QUAL_RANK.get(str(x.get("quality") or "").lower(), 0),
-                     reverse=True)
-            to_move.append(lst[0]["filename"])
-            for x in lst[1:]:
-                low_quality.append(x["filename"])
+        to_move, del_cache, del_lib, kept_variants = [], [], [], 0
+        for key, lst in cache_groups.items():
+            lst.sort(key=_rank, reverse=True)
+            best = lst[0]
+            lower = lst[1:]
+
+            # 版本变体保护：只要该组任一文件是 Live/Remix 等，整组不做跨库去重
+            if any(self._is_version_variant(x.get("name") or "",
+                                            x.get("album") or "") for x in lst):
+                to_move.extend(x["filename"] for x in lst)
+                kept_variants += len(lst)
+                continue
+
+            # 同歌名但专辑不同且都是最高音质 → 视为不同专辑版本，全部保留
+            best_rank = _rank(best)
+            top = [x for x in lst if _rank(x) == best_rank]
+            albums = {self._norm(x.get("album") or "") for x in top}
+            if len(top) > 1 and len(albums) > 1:
+                to_move.extend(x["filename"] for x in lst if _rank(x) == best_rank)
+                kept_variants += len(top)
+                lower = [x for x in lst if _rank(x) < best_rank]
+
+            # 缓存组内低音质：直接从缓存删掉
+            del_cache.extend(x["filename"] for x in lower)
+
+            lib_same = lib_index.get(key) or []
+            if lib_same:
+                lib_same.sort(key=_rank, reverse=True)
+                lib_best = lib_same[0]
+                if _rank(best) <= _rank(lib_best):
+                    # 音乐库已有同等或更好 → 缓存这份是多余的，删掉
+                    del_cache.append(best["filename"])
+                    continue
+                # 缓存音质更高 → 删音乐库全部旧版，搬新版
+                del_lib.extend(x["filename"] for x in lib_same)
+                to_move.append(best["filename"])
+            else:
+                to_move.append(best["filename"])
 
         moved = 0
-        try:
-            r = requests.post(f"{self._server_url}/api/music/cache/move",
-                              params={"token": self._token},
-                              json={"filenames": to_move},
-                              headers={"Content-Type": "application/json", **self._headers()},
-                              timeout=180)
-            if r.status_code == 200:
-                moved = int((r.json() or {}).get("successCount") or 0)
-                logger.info(f"【{self.plugin_name}】已搬移 {moved} 首到音乐库 /server/music")
-            else:
-                logger.warning(f"【{self.plugin_name}】搬移失败 HTTP {r.status_code}: {r.text[:100]}")
-        except Exception as e:
-            logger.error(f"【{self.plugin_name}】搬移异常：{e}")
-
-        # 低音质版本：有管理员密码才删，否则留在缓存不动
-        if low_quality and self._lx_admin_pwd:
+        # 1) 搬移
+        if to_move:
             try:
-                requests.post(f"{self._server_url}/api/music/cache/remove",
-                              params={"token": self._token},
-                              json={"filenames": low_quality},
-                              headers={"Content-Type": "application/json",
-                                       "x-frontend-auth": self._lx_admin_pwd,
-                                       **self._headers()},
-                              timeout=120)
-                logger.info(f"【{self.plugin_name}】已清理 {len(low_quality)} 个低音质重复文件")
+                r = requests.post(f"{self._server_url}/api/music/cache/move",
+                                  params={"token": self._token},
+                                  json={"filenames": to_move},
+                                  headers={"Content-Type": "application/json", **self._headers()},
+                                  timeout=180)
+                if r.status_code == 200:
+                    moved = int((r.json() or {}).get("successCount") or 0)
+                    logger.info(f"【{self.plugin_name}】已搬移 {moved} 首到音乐库 /server/music")
+                else:
+                    logger.warning(f"【{self.plugin_name}】搬移失败 HTTP {r.status_code}: {r.text[:100]}")
             except Exception as e:
-                logger.warning(f"【{self.plugin_name}】清理低音质失败：{e}")
+                logger.error(f"【{self.plugin_name}】搬移异常：{e}")
+
+        # 2) 删除文件（缓存里的低音质 + 音乐库里的被替代旧版）
+        cleaned = 0
+        all_del = list(dict.fromkeys(del_cache + del_lib))
+        if all_del and self._lx_admin_pwd:
+            try:
+                r = requests.post(f"{self._server_url}/api/music/cache/remove",
+                                  params={"token": self._token},
+                                  json={"filenames": all_del},
+                                  headers={"Content-Type": "application/json",
+                                           "x-frontend-auth": self._lx_admin_pwd,
+                                           **self._headers()},
+                                  timeout=180)
+                if r.status_code in (200, 409):
+                    cleaned = int((r.json() or {}).get("deletedCount") or 0)
+                    logger.info(f"【{self.plugin_name}】去重清理 {cleaned} 个文件"
+                                f"（缓存低音质 {len(del_cache)} / 音乐库旧版 {len(del_lib)}）")
+            except Exception as e:
+                logger.warning(f"【{self.plugin_name}】去重清理失败：{e}")
 
         msg = f"搬移 {moved} 首到音乐库"
-        if low_quality:
-            msg += f"，跳过 {len(low_quality)} 个低音质重复" + ("（已清理）" if self._lx_admin_pwd else "（留缓存）")
-        return moved, len(low_quality), msg
+        if cleaned:
+            msg += f"，去重清理 {cleaned} 个（缓存 {len(del_cache)} + 库内 {len(del_lib)}）"
+        elif all_del:
+            msg += f"，跳过 {len(all_del)} 个重复（未配管理员密码，未删）"
+        if kept_variants:
+            msg += f"，保留 {kept_variants} 个版本变体"
+        return moved, cleaned, msg
+
 
     def queue_download_with_fallback(self, songs: List[dict],
                                      quality: Optional[str] = None) -> Tuple[int, str]:
