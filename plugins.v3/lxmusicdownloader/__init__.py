@@ -54,7 +54,7 @@ URL_TEMPLATES = {
 }
 
 # 下载音源优先级：酷狗 → QQ → 网易云。仅排除 kw（酷我，用户要求）
-SEARCH_SOURCES = ["kg", "tx", "wy"]
+SEARCH_SOURCES = ["wy", "kg", "tx"]
 
 # 队列并发数与音质回落顺序
 QUEUE_CONCURRENCY = 3
@@ -70,7 +70,7 @@ class LxMusicDownloader(_PluginBase):
     plugin_name = "LX音乐下载"
     plugin_desc = "音乐专辑订阅联动：订阅-音乐新增专辑时按网易云/QQ 搜索整张专辑并经 LX音乐下载；支持音质选择"
     plugin_icon = "https://gitee.com/makimayang/obsidian/raw/main/icon.png"
-    plugin_version = "3.4"
+    plugin_version = "3.5"
     plugin_author = "虾虾"
     author_url = ""
     plugin_config_prefix = "lxmusicdownloader_"
@@ -459,6 +459,9 @@ class LxMusicDownloader(_PluginBase):
                 logger.error(f"【{self.plugin_name}】搜索失败 HTTP {r.status_code}: {r.text[:120]}")
                 return []
             data = r.json()
+            # 服务端返回 {list:[...]}（v2.1.2 实测），旧版本可能是裸数组 —— 两种都认
+            if isinstance(data, dict):
+                data = data.get("list") or data.get("data") or data.get("songs") or []
             if not isinstance(data, list):
                 return []
             # 双保险：kw（酷我）一律剔除
@@ -662,6 +665,23 @@ class LxMusicDownloader(_PluginBase):
                 inst.music_subscribe_check()
             except Exception as e:
                 logger.error(f"【{self.plugin_name}】音乐订阅检查异常：{e}")
+            # 每轮把缓存里的歌搬进音乐库并去重 —— 保证最终落点是 music/<用户>，
+            # 而不是把 128k/320k 副本一直堆在 cache/<用户> 里。
+            try:
+                if inst._enabled:
+                    _mv, _cl, _mmsg = inst.promote_to_music()
+                    if _mv or _cl:
+                        logger.info(f"【{self.plugin_name}】缓存入库：{_mmsg}")
+            except Exception as e:
+                logger.error(f"【{self.plugin_name}】缓存入库异常：{e}")
+            # 核对订阅专辑的曲目数，缺的补齐（只在订阅范围内，不碰无关歌曲）
+            try:
+                if inst._enabled and inst._music_sub:
+                    _fn, _fmsg = inst.check_subscribed_albums()
+                    if _fn:
+                        logger.info(f"【{self.plugin_name}】专辑补全：{_fmsg}")
+            except Exception as e:
+                logger.error(f"【{self.plugin_name}】专辑补全异常：{e}")
             # 关键词订阅较重，每 24 轮一次
             try:
                 if inst._enabled and inst._subscribes.strip() and keyword_tick % 24 == 0:
@@ -1099,16 +1119,32 @@ class LxMusicDownloader(_PluginBase):
         return None, None, None
 
     def _find_song_info(self, track: dict) -> Optional[dict]:
-        """按曲名+歌手在 kg/tx 找可下载的 songInfo。
+        """按曲名+歌手在 wy/kg/tx 找可下载的 songInfo。
         严格校验同名同歌手，且 source 不得为 kw（酷我）。
+        某个音源一旦返回空（常见于自定义音源挂掉导致 HTTP 500），
+        30 分钟内不再尝试，否则整张专辑几十首每首都白等一次超时。
         """
         name = track.get("name") or ""
         artist = track.get("artist") or ""
         kw = f"{name} {artist}".strip()
         if not kw:
             return None
+        dead = getattr(self, "_dead_sources", None)
+        if dead is None:
+            dead = self._dead_sources = {}
+        now = time.time()
         for src in SEARCH_SOURCES:
-            for s in self.search(kw, limit=6, source=src):
+            ts = dead.get(src)
+            if ts and now - ts < 1800:
+                continue
+            try:
+                found = self.search(kw, limit=6, source=src) or []
+            except Exception:
+                found = []
+            if not found:
+                dead[src] = now
+                continue
+            for s in found:
                 if not s.get("songmid"):
                     continue
                 if (s.get("source") or "").lower() == "kw":
@@ -1266,18 +1302,170 @@ class LxMusicDownloader(_PluginBase):
     _QUAL_RANK = {"128k": 1, "192k": 2, "320k": 3, "flac": 4,
                   "flac24bit": 5, "hires": 6, "atmos": 7, "master": 8}
 
+    # 音频扩展名（本地扫描用）
+    _AUDIO_EXT = ("mp3", "flac", "m4a", "wav", "aac", "ogg", "ape", "wma")
+    # 音质标记（文件名模板里的 token）
+    _QUAL_TOKEN = ("flac24bit", "hires", "master", "atmos", "flac", "320k", "192k", "128k")
+
+    def _parse_filename(self, fn: str, ext: str = "") -> Tuple[str, str, str, str]:
+        """按命名模板 `歌名 - 歌手 - 音质[ - 专辑].ext` 解析出 (歌名, 歌手, 专辑, 音质)"""
+        stem, e = fn, ext
+        if not e and "." in fn:
+            stem, e = fn.rsplit(".", 1)
+        elif e and stem.lower().endswith("." + e):
+            stem = stem[: -(len(e) + 1)]
+        parts = stem.split(" - ")
+        qi = -1
+        for i, p in enumerate(parts):
+            if p.strip().lower() in self._QUAL_TOKEN:
+                qi = i
+                break
+        if qi >= 1:
+            name = " - ".join(parts[: qi - 1]) if qi - 1 > 0 else parts[0]
+            singer = parts[qi - 1]
+            qual = parts[qi].strip().lower()
+            album = " - ".join(parts[qi + 1:]) if len(parts) > qi + 1 else ""
+            return name, singer, album, qual
+        if len(parts) >= 2:
+            return " - ".join(parts[:-1]), parts[-1], "", ""
+        return stem, "", "", ""
+
+    def _local_scan(self, folder: str = "cache") -> List[dict]:
+        """直接扫描宿主机音乐目录，返回与服务端 cache/list 同构的条目。
+
+        为什么需要它：服务端 /api/music/cache/list 在本机实测长期返回 {"data":[]}
+        （磁盘上 465 个文件，接口一个都不给），而插件的全部去重/搬移逻辑都建立在
+        cache_list 之上 —— 一旦它返回空，插件就会认为「库是空的」，
+        于是同一首歌被反复重新下载，128k/320k 并存、(Explicit) 专辑副本满天飞。
+        因此这里以本地文件系统为准，索引文件只用来补元数据。
+        """
+        base = (getattr(self, "_local_music_dir", "") or "/media/downloads/music").rstrip("/")
+        user = getattr(self, "_lx_user", "") or "admin"
+        d = os.path.join(base, folder, user)
+        out: List[dict] = []
+        if not os.path.isdir(d):
+            return out
+        # 1) 服务端写的索引（元数据最全，但常常是旧的甚至不存在）
+        idx = {}
+        try:
+            p = os.path.join(d, "cache_index.json")
+            if os.path.isfile(p):
+                with open(p, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                if isinstance(raw, dict):
+                    for v in raw.values():
+                        if isinstance(v, dict) and v.get("filename"):
+                            idx[v["filename"]] = v
+        except Exception as e:
+            logger.warning(f"【{self.plugin_name}】读本地索引失败({folder})：{e}")
+        # 2) 扫真实文件（文件是唯一真相）
+        try:
+            names = os.listdir(d)
+        except Exception as e:
+            logger.warning(f"【{self.plugin_name}】扫描目录失败 {d}：{e}")
+            return out
+        for fn in names:
+            ext = fn.rsplit(".", 1)[-1].lower() if "." in fn else ""
+            if ext not in self._AUDIO_EXT:
+                continue
+            try:
+                st = os.stat(os.path.join(d, fn))
+            except Exception:
+                continue
+            meta = dict(idx.get(fn) or {})
+            nm = meta.get("name") or ""
+            sg = meta.get("singer") or ""
+            al = meta.get("album") or ""
+            ql = meta.get("quality") or ""
+            if not nm:
+                nm, sg, al, ql = self._parse_filename(fn, ext)
+            out.append({
+                "name": nm or fn.rsplit(".", 1)[0],
+                "singer": sg or "",
+                "album": al or "",
+                "quality": str(ql or "").lower(),
+                "filename": fn,
+                "ext": ext,
+                "folder": folder,
+                "size": meta.get("size") or st.st_size,
+                "mtime": meta.get("mtime") or st.st_mtime * 1000,
+                "songmid": meta.get("songmid"),
+                "source": meta.get("source"),
+                "bitrate": meta.get("bitrate"),
+            })
+        return out
+
+    def _local_path(self, folder: str, filename: str) -> str:
+        base = (getattr(self, "_local_music_dir", "") or "/media/downloads/music").rstrip("/")
+        user = getattr(self, "_lx_user", "") or "admin"
+        return os.path.join(base, folder, user, filename)
+
+    def _local_move(self, filenames: List[str]) -> int:
+        """cache/<user> → music/<user>（直接文件系统搬移，不依赖服务端 API）"""
+        n = 0
+        for fn in filenames:
+            src = self._local_path("cache", fn)
+            dst = self._local_path("music", fn)
+            if not os.path.isfile(src):
+                continue
+            try:
+                if os.path.exists(dst):
+                    os.remove(src)          # 库里已有同名文件 → 删缓存副本，避免重复
+                else:
+                    os.replace(src, dst)
+                n += 1
+            except Exception as e:
+                logger.warning(f"【{self.plugin_name}】搬移失败 {fn}：{e}")
+        # 歌词跟随
+        for fn in list(filenames):
+            lrc = fn.rsplit(".", 1)[0] + ".lrc"
+            s, d = self._local_path("cache", lrc), self._local_path("music", lrc)
+            if os.path.isfile(s):
+                try:
+                    if os.path.exists(d):
+                        os.remove(s)
+                    else:
+                        os.replace(s, d)
+                except Exception:
+                    pass
+        return n
+
+    def _local_remove(self, filenames: List[str], folder: str = "cache") -> int:
+        """删除指定目录下的文件（含同名歌词）"""
+        n = 0
+        for fn in filenames:
+            p = self._local_path(folder, fn)
+            for target in (p, p.rsplit(".", 1)[0] + ".lrc"):
+                try:
+                    if os.path.isfile(target):
+                        os.remove(target)
+                        if target == p:
+                            n += 1
+                except Exception as e:
+                    logger.warning(f"【{self.plugin_name}】删除失败 {target}：{e}")
+        return n
+
     def cache_list(self, folder: str = "cache") -> List[dict]:
-        """列出服务端缓存目录里的文件"""
+        """列出缓存/音乐库文件。服务端 API 优先；返回空则回落到本地文件系统扫描。"""
+        items: List[dict] = []
         try:
             r = requests.get(f"{self._server_url}/api/music/cache/list",
                              params={"token": self._token}, headers=self._headers(), timeout=40)
-            if r.status_code != 200:
-                return []
-            items = (r.json() or {}).get("data") or []
-            return [x for x in items if (x.get("folder") or "cache") == folder]
+            if r.status_code == 200:
+                items = [x for x in ((r.json() or {}).get("data") or [])
+                         if (x.get("folder") or "cache") == folder and x.get("filename")]
         except Exception as e:
-            logger.warning(f"【{self.plugin_name}】读缓存列表失败：{e}")
-            return []
+            logger.warning(f"【{self.plugin_name}】读服务端缓存列表失败：{e}")
+        local = self._local_scan(folder)
+        if not items:
+            if local:
+                logger.info(f"【{self.plugin_name}】服务端列表为空 → 本地扫描兜底："
+                            f"{folder} 实测 {len(local)} 个文件")
+            return local
+        # 两边都有：以服务端元数据为主，用它漏掉的本地文件补齐
+        have = {x.get("filename") for x in items}
+        items.extend([x for x in local if x.get("filename") not in have])
+        return items
 
     def clear_open_cache(self) -> Tuple[int, str]:
         """清空 cache/_open（公开用户缓存目录）。
@@ -1435,27 +1623,31 @@ class LxMusicDownloader(_PluginBase):
             # 同名不同专辑保护
             best_rank = _rank(best)
             top = [x for x in lst if _rank(x) == best_rank]
-            albums = {self._norm(x.get("album") or "") for x in top}
+            albums = {self._album_key(x.get("album") or "") for x in top}
             if len(top) > 1 and len(albums) > 1:
                 kept_variants += len(top)
                 lower = [x for x in lst if _rank(x) < best_rank]
             to_del.extend(x["filename"] for x in lower)
 
         cleaned = 0
-        if to_del and self._lx_admin_pwd:
-            try:
-                r = requests.post(f"{self._server_url}/api/music/cache/remove",
-                                  params={"token": self._token},
-                                  json={"filenames": to_del},
-                                  headers={"Content-Type": "application/json",
-                                           "x-frontend-auth": self._lx_admin_pwd,
-                                           **self._headers()},
-                                  timeout=180)
-                if r.status_code in (200, 409):
-                    cleaned = int((r.json() or {}).get("deletedCount") or 0)
-                    logger.info(f"【{self.plugin_name}】库内去重清理 {cleaned} 个文件")
-            except Exception as e:
-                logger.warning(f"【{self.plugin_name}】库内去重失败：{e}")
+        if to_del:
+            cleaned = self._local_remove(to_del, "music")
+            if cleaned:
+                logger.info(f"【{self.plugin_name}】库内去重清理 {cleaned} 个文件")
+            elif self._lx_admin_pwd:
+                try:
+                    r = requests.post(f"{self._server_url}/api/music/cache/remove",
+                                      params={"token": self._token},
+                                      json={"filenames": to_del},
+                                      headers={"Content-Type": "application/json",
+                                               "x-frontend-auth": self._lx_admin_pwd,
+                                               **self._headers()},
+                                      timeout=180)
+                    if r.status_code in (200, 409):
+                        cleaned = int((r.json() or {}).get("deletedCount") or 0)
+                        logger.info(f"【{self.plugin_name}】库内去重清理 {cleaned} 个文件（服务端）")
+                except Exception as e:
+                    logger.warning(f"【{self.plugin_name}】库内去重失败：{e}")
 
         msg = f"音乐库内去重：清理 {cleaned} 个重复" if cleaned else "音乐库内无重复"
         if kept_variants:
@@ -1530,7 +1722,7 @@ class LxMusicDownloader(_PluginBase):
             # 同歌名但专辑不同且都是最高音质 → 视为不同专辑版本，全部保留
             best_rank = _rank(best)
             top = [x for x in lst if _rank(x) == best_rank]
-            albums = {self._norm(x.get("album") or "") for x in top}
+            albums = {self._album_key(x.get("album") or "") for x in top}
             if len(top) > 1 and len(albums) > 1:
                 to_move.extend(x["filename"] for x in lst if _rank(x) == best_rank)
                 kept_variants += len(top)
@@ -1554,40 +1746,54 @@ class LxMusicDownloader(_PluginBase):
                 to_move.append(best["filename"])
 
         moved = 0
-        # 1) 搬移
+        # 1) 搬移（直接文件系统操作，服务端 cache/move 接口在本机同样不可靠）
         if to_move:
-            try:
-                r = requests.post(f"{self._server_url}/api/music/cache/move",
-                                  params={"token": self._token},
-                                  json={"filenames": to_move},
-                                  headers={"Content-Type": "application/json", **self._headers()},
-                                  timeout=180)
-                if r.status_code == 200:
-                    moved = int((r.json() or {}).get("successCount") or 0)
-                    logger.info(f"【{self.plugin_name}】已搬移 {moved} 首到音乐库 /server/music")
-                else:
-                    logger.warning(f"【{self.plugin_name}】搬移失败 HTTP {r.status_code}: {r.text[:100]}")
-            except Exception as e:
-                logger.error(f"【{self.plugin_name}】搬移异常：{e}")
+            moved = self._local_move(to_move)
+            if moved:
+                logger.info(f"【{self.plugin_name}】已搬移 {moved} 首到音乐库 "
+                            f"{self._local_path('music', '')}")
+            else:
+                # 文件系统没搬成（路径映射不对等）→ 退回服务端接口
+                try:
+                    r = requests.post(f"{self._server_url}/api/music/cache/move",
+                                      params={"token": self._token},
+                                      json={"filenames": to_move},
+                                      headers={"Content-Type": "application/json", **self._headers()},
+                                      timeout=180)
+                    if r.status_code == 200:
+                        moved = int((r.json() or {}).get("successCount") or 0)
+                        logger.info(f"【{self.plugin_name}】已搬移 {moved} 首到音乐库（服务端）")
+                    else:
+                        logger.warning(f"【{self.plugin_name}】搬移失败 HTTP {r.status_code}: {r.text[:100]}")
+                except Exception as e:
+                    logger.error(f"【{self.plugin_name}】搬移异常：{e}")
 
         # 2) 删除文件（缓存里的低音质 + 音乐库里的被替代旧版）
         cleaned = 0
         all_del = list(dict.fromkeys(del_cache + del_lib))
-        if all_del and self._lx_admin_pwd:
-            try:
-                r = requests.post(f"{self._server_url}/api/music/cache/remove",
-                                  params={"token": self._token},
-                                  json={"filenames": all_del},
-                                  headers={"Content-Type": "application/json",
-                                           "x-frontend-auth": self._lx_admin_pwd,
-                                           **self._headers()},
-                                  timeout=180)
-                if r.status_code in (200, 409):
-                    cleaned = int((r.json() or {}).get("deletedCount") or 0)
-                    logger.info(f"【{self.plugin_name}】去重清理 {cleaned} 个文件"
-                                f"（缓存低音质 {len(del_cache)} / 音乐库旧版 {len(del_lib)}）")
-            except Exception as e:
-                logger.warning(f"【{self.plugin_name}】去重清理失败：{e}")
+        if all_del:
+            # 先走本地文件系统（可靠、可验证）
+            c1 = self._local_remove(del_cache, "cache")
+            c2 = self._local_remove(del_lib, "music")
+            cleaned = c1 + c2
+            if cleaned:
+                logger.info(f"【{self.plugin_name}】去重清理 {cleaned} 个文件"
+                            f"（缓存低音质 {c1} / 音乐库旧版 {c2}）")
+            elif self._lx_admin_pwd:
+                # 本地没删到 → 退回服务端接口
+                try:
+                    r = requests.post(f"{self._server_url}/api/music/cache/remove",
+                                      params={"token": self._token},
+                                      json={"filenames": all_del},
+                                      headers={"Content-Type": "application/json",
+                                               "x-frontend-auth": self._lx_admin_pwd,
+                                               **self._headers()},
+                                      timeout=180)
+                    if r.status_code in (200, 409):
+                        cleaned = int((r.json() or {}).get("deletedCount") or 0)
+                        logger.info(f"【{self.plugin_name}】去重清理 {cleaned} 个文件（服务端）")
+                except Exception as e:
+                    logger.warning(f"【{self.plugin_name}】去重清理失败：{e}")
 
         msg = f"搬移 {moved} 首到音乐库"
         if cleaned:
@@ -1622,7 +1828,7 @@ class LxMusicDownloader(_PluginBase):
             # 关键：队列状态常报 error 但文件其实已落地，以实际文件列表为准
             smap = self._queue_status_map()
             snap = self._cache_snapshot()
-            still = []
+            still, waiting = [], 0
             for s in remaining:
                 if self._cache_exists(s, q, snap):
                     ok_total += 1           # 真落地了
@@ -1631,11 +1837,17 @@ class LxMusicDownloader(_PluginBase):
                 st = smap.get(key, "")
                 if st in ("finished", "exists"):
                     ok_total += 1
+                elif st in ("error", "failed"):
+                    still.append(s)          # 服务端明确失败 → 才降档重试
                 else:
-                    still.append(s)          # 确实没有 → 换下一档再试
+                    # 排队中 / 下载中 / 状态未知 —— 只是还没下完，绝不能降档重提，
+                    # 否则同一首歌会被再下一份 128k，正是重复文件的来源
+                    waiting += 1
             remaining = still
+            if waiting:
+                notes.append(f"{q}: {waiting} 首仍在队列中，保持原音质等待")
             if remaining:
-                logger.info(f"【{self.plugin_name}】{q} 有 {len(remaining)} 首未成功，准备降档重试")
+                logger.info(f"【{self.plugin_name}】{q} 有 {len(remaining)} 首明确失败，准备降档重试")
 
         tail = (f"，成功 {ok_total} 首，其余 {len(remaining)} 首无可用源"
                 if remaining else f"，{ok_total} 首全部成功")
@@ -1742,6 +1954,140 @@ class LxMusicDownloader(_PluginBase):
                 except Exception:
                     pass
             time.sleep(2)
+
+    # 专辑名归一化：不同源/不同版本会给出 "(Explicit)"、"(Deluxe Edition)" 等后缀，
+    # 不剥掉就会被当成两张不同专辑 → 同一批歌下两遍。
+    _ALBUM_SUFFIX = re.compile(
+        r"[\(\（\[\【][^\)\）\]\】]*(explicit|deluxe|remaster|remastered|edition|version|"
+        r"bonus|expanded|anniversary|special|初回|限定)[^\)\）\]\】]*[\)\）\]\】]",
+        re.I)
+
+    def _album_key(self, album: str) -> str:
+        """专辑名归一化（剥掉 Explicit/Deluxe/Remastered 等版本后缀）"""
+        a = str(album or "")
+        prev = None
+        while prev != a:
+            prev = a
+            a = self._ALBUM_SUFFIX.sub("", a)
+        return self._norm(a)
+
+    def _subscribed_albums(self) -> List[dict]:
+        """取 MoviePilot 里的音乐专辑订阅"""
+        try:
+            from app.db.oper.subscribe import SubscribeOper
+            subs = SubscribeOper().list() or []
+        except Exception as e:
+            logger.error(f"【{self.plugin_name}】读取音乐订阅失败：{e}")
+            return []
+        out = []
+        for s in subs:
+            if (getattr(s, "type", None) or "") != "音乐":
+                continue
+            mt = getattr(s, "music_type", None)
+            if mt and mt != "album":
+                continue
+            nm = getattr(s, "name", None)
+            if not nm:
+                continue
+            out.append({
+                "name": nm,
+                "total_tracks": getattr(s, "total_tracks", None),
+                "media_source": getattr(s, "media_source", None),
+                "media_id": getattr(s, "media_id", None),
+            })
+        return out
+
+    def check_subscribed_albums(self, max_fill: int = 40) -> Tuple[int, str]:
+        """核对「已订阅音乐专辑」的曲目数，把缺的补下来。
+
+        只补订阅的专辑 —— 非订阅专辑一律不碰，满足「不下载非订阅歌曲」。
+        目标曲目数优先取订阅自带的 total_tracks；具体缺哪几首由专辑曲目表给出。
+        """
+        subs = self._subscribed_albums()
+        if not subs:
+            return 0, "没有音乐专辑订阅"
+        lib = self.cache_list("music")
+        local: dict = {}
+        for it in lib:
+            k = self._album_key(it.get("album") or "")
+            if not k:
+                continue
+            grp = local.setdefault(k, {"tracks": set(), "artist": it.get("singer") or "",
+                                       "raw": it.get("album") or ""})
+            grp["tracks"].add(self._norm(it.get("name") or ""))
+            if not grp.get("artist"):
+                grp["artist"] = it.get("singer") or ""
+
+        # 全库歌曲名集合：同一首歌常以别的专辑名入库（本库有 130 个文件无专辑信息），
+        # 只按专辑分组比对会误判成「缺失」→ 重复下载。这里以全库歌名为准。
+        all_names = {self._norm(it.get("name") or "") for it in lib}
+
+        missing, notes = [], []
+        for a in subs:
+            key = self._album_key(a["name"])
+            try:
+                expect = int(a["total_tracks"]) if a.get("total_tracks") else None
+            except Exception:
+                expect = None
+            grp = local.get(key) or {"tracks": set(), "artist": ""}
+            have = grp["tracks"]
+            if expect and len(have) >= expect:
+                continue                      # 数量已达标，不必再查曲目表
+            artist = grp.get("artist") or ""
+            if not artist and (a.get("media_source") or "").lower() == "musicbrainz" and a.get("media_id"):
+                try:
+                    artist = self._mb_artist(a["media_id"])
+                    time.sleep(1.2)
+                except Exception:
+                    artist = ""
+            kw = f"{a['name']} {artist}".strip()
+            try:
+                _src, _real, tracks = self.find_album(kw, expect)
+            except Exception as e:
+                notes.append(f"{a['name']}: 查专辑异常 {e}")
+                continue
+            if not tracks:
+                notes.append(f"{a['name']}: 未找到专辑曲目表")
+                continue
+            real_tracks = [t for t in tracks if self._is_real_track(t.get("name") or "")]
+            # 版本不符保护：订阅 17 首却查到 40 首（如 Abbey Road 命中 Super Deluxe Edition），
+            # 说明匹配到了豪华版/加长版 —— 直接跳过，否则会把一堆非订阅曲目也下下来。
+            if expect and len(real_tracks) > expect:
+                notes.append(f"{a['name']}: 曲目表版本不符（查到 {len(real_tracks)} 首 > "
+                             f"订阅 {expect} 首），跳过")
+                continue
+            miss = [t for t in real_tracks
+                    if self._norm(t.get("name") or "") not in all_names]
+            if not miss:
+                if expect and len(have) < expect:
+                    notes.append(f"{a['name']}: 本地 {len(have)}/{expect}，"
+                                 f"但站上曲目表也只有 {len(real_tracks)} 首")
+                continue
+            notes.append(f"{a['name']}: 本地 {len(have)}"
+                         f"{('/' + str(expect)) if expect else ''}，缺 {len(miss)}")
+            missing.extend(miss)
+            time.sleep(1.5)
+
+        if not missing:
+            detail = "；".join(notes)
+            return 0, "订阅专辑曲目均完整" + (f"（{detail}）" if detail else "")
+        detail = "；".join(notes)
+        # 曲目表里只有 name/artist，必须逐曲解析出 songmid 才能入队，否则 queue_download 全跳过
+        picked = []
+        for t in missing[:max_fill]:
+            try:
+                song = self._find_song_info(t)
+            except Exception:
+                song = None
+            if song:
+                picked.append(song)
+            time.sleep(0.3)
+        if not picked:
+            logger.info(f"【{self.plugin_name}】订阅专辑补全：{detail} → 曲目无法解析音源")
+            return 0, f"{detail}；定位到缺曲但全部无法解析音源"
+        n, msg = self.queue_download_with_fallback(picked, self._quality)
+        logger.info(f"【{self.plugin_name}】订阅专辑补全：{detail} → 解析 {len(picked)} 首，提交 {n} 首")
+        return n, f"{detail}；已提交 {n} 首补全（{msg}）"
 
     # ---------------- API 端点实现 ----------------
 
