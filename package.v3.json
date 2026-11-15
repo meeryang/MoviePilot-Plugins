@@ -104,13 +104,14 @@
   "DownloadMonitor": {
     "name": "下载任务监控",
     "description": "实时监控 qBittorrent / Transmission 全部任务，支持序号/名称/上传/下载/进度/大小/时间/状态/剩余时间/比率/流行度/分类/标签多字段排序",
-    "version": "1.0.2",
+    "version": "1.0.3",
     "author": "虾虾",
     "level": 1,
     "history": {
       "1.0.1": "支持 qBittorrent/Transmission 全任务监控，11 项明细字段，16 种排序键",
       "1.0.0": "首版",
-      "1.0.2": "支持 qBittorrent/Transmission 全任务监控，11 项明细字段，16 种排序键"
+      "1.0.2": "支持 qBittorrent/Transmission 全任务监控，11 项明细字段，16 种排序键",
+      "1.0.3": "支持 qBittorrent/Transmission 全任务监控，11 项明细字段，16 种排序键"
     }
   }
 }
