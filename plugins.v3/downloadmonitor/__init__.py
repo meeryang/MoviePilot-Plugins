@@ -89,7 +89,7 @@ class DownloadMonitor(_PluginBase):
     plugin_desc = "实时监控 qBittorrent / Transmission 全部任务，支持多字段排序"
     plugin_icon = ""
     plugin_color = "#1976D2"
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     plugin_author = "虾虾"
     author_url = "https://github.com/meeryang/MoviePilot-Plugins"
     plugin_config_prefix = "downloadmonitor_"
@@ -101,6 +101,9 @@ class DownloadMonitor(_PluginBase):
     _downloaders: List[str] = []
     _default_sort: str = "added"
     _default_order: str = "desc"
+    # 仪表板短时缓存（类级，避免频繁打下载器）
+    _cache: Optional[List[dict]] = None
+    _cache_ts: float = 0.0
 
     def init_plugin(self, config: Optional[Dict[str, Any]] = None) -> None:
         """读取配置；本插件不使用后台线程，全部数据由面板按需拉取。"""
@@ -287,6 +290,137 @@ class DownloadMonitor(_PluginBase):
         html = self._build_html()
         return Response(content=html, media_type="text/html; charset=utf-8",
                         headers={"Cache-Control": "no-store"})
+
+    # ------------------------------------------------------------------ 首页仪表板
+    def get_dashboard_meta(self) -> Optional[List[Dict[str, str]]]:
+        """注册首页仪表板条目。"""
+        if not self._enabled:
+            return []
+        return [{"key": "downloadmonitor", "name": "下载任务监控"}]
+
+    def get_dashboard(
+        self, key: str = "", **kwargs: Any
+    ) -> Optional[Tuple[Dict[str, Any], Dict[str, Any], Optional[List[Dict[str, Any]]]]]:
+        """首页仪表板：任务概览卡片 + 正在下载的 TOP5。"""
+        if not self._enabled:
+            return None
+        cols = {"cols": 12, "md": 6}
+        attrs = {"refresh": max(int(self._interval), 15), "title": "下载任务监控"}
+        rows = self._cached_rows()
+        if not rows:
+            return cols, attrs, [
+                {"component": "VAlert",
+                 "props": {"type": "info", "variant": "tonal",
+                           "text": "暂无任务，或下载器未连接。点插件页的「打开监控面板」查看详情。"}}
+            ]
+
+        total = len(rows)
+        downloading = sum(1 for r in rows if "下载" in str(r.get("state", "")))
+        seeding = sum(1 for r in rows if "做种" in str(r.get("state", "")))
+        paused = sum(1 for r in rows
+                     if "暂停" in str(r.get("state", "")) or "停止" in str(r.get("state", "")))
+        finished = sum(1 for r in rows if float(r.get("progress") or 0) >= 100)
+        upspeed = sum(int(r.get("upspeed") or 0) for r in rows)
+        dlspeed = sum(int(r.get("dlspeed") or 0) for r in rows)
+
+        cards = [
+            {"component": "VRow", "content": [
+                self._stat_card("任务总数", str(total), "mdi-database", 4, 2),
+                self._stat_card("下载中", str(downloading), "mdi-download", 4, 2),
+                self._stat_card("做种中", str(seeding), "mdi-upload", 4, 2),
+                self._stat_card("已完成", str(finished), "mdi-check-circle-outline", 4, 2),
+                self._stat_card("总下载速度", self._fmt_speed(dlspeed), "mdi-speedometer", 4, 2),
+                self._stat_card("总上传速度", self._fmt_speed(upspeed), "mdi-cloud-upload", 4, 2),
+            ]},
+        ]
+
+        active = [r for r in rows if int(r.get("dlspeed") or 0) > 0]
+        if not active:
+            active = [r for r in rows if float(r.get("progress") or 0) < 100]
+        active.sort(key=lambda r: (int(r.get("dlspeed") or 0), float(r.get("progress") or 0)),
+                    reverse=True)
+        top = active[:5]
+        if top:
+            lines: List[dict] = [
+                {"component": "div",
+                 "props": {"class": "text-subtitle-2 font-weight-bold mt-3 mb-1"},
+                 "text": "正在下载 TOP5"},
+            ]
+            for r in top:
+                name = str(r.get("name") or "")
+                if len(name) > 46:
+                    name = name[:46] + "…"
+                lines.append({
+                    "component": "div",
+                    "props": {"class": "text-caption text-medium-emphasis d-flex"},
+                    "content": [
+                        {"component": "span", "props": {"class": "flex-grow-1", "style": "min-width:0"},
+                         "text": name},
+                        {"component": "span", "props": {"class": "ms-2"},
+                         "text": f"{float(r.get('progress') or 0):.1f}%  {self._fmt_speed(r.get('dlspeed'))}"},
+                    ],
+                })
+            cards.append({"component": "div", "content": lines})
+
+        paused_text = f" ｜ 暂停 {paused} 个" if paused else ""
+        cards.append({
+            "component": "div",
+            "props": {"class": "text-caption text-medium-emphasis mt-2"},
+            "text": f"刷新间隔 {self._interval} 秒 ｜ 数据来自 {len({r.get('downloader') for r in rows})} 个下载器"
+                    + paused_text,
+        })
+        return cols, attrs, cards
+
+    def _cached_rows(self) -> List[dict]:
+        """仪表板渲染期内复用短时缓存，避免每次刷新都打一遍下载器。"""
+        cls = DownloadMonitor
+        now = time.time()
+        if cls._cache is not None and (now - cls._cache_ts) < max(5, self._interval):
+            return cls._cache
+        try:
+            rows, _errs = self._collect()
+        except Exception as err:  # noqa: BLE001
+            logger.error(f"下载任务监控：仪表板采集失败 {err}")
+            return []
+        cls._cache, cls._cache_ts = rows, now
+        return rows
+
+    @staticmethod
+    def _stat_card(title: str, value: str, icon: str, cols: int, md: int) -> Dict[str, Any]:
+        return {
+            "component": "VCol",
+            "props": {"cols": cols, "md": md},
+            "content": [
+                {"component": "VCard", "props": {"variant": "tonal"},
+                 "content": [
+                     {"component": "VCardText", "props": {"class": "d-flex align-center"},
+                      "content": [
+                          {"component": "VIcon",
+                           "props": {"icon": icon, "size": 30, "class": "me-3", "color": "primary"}},
+                          {"component": "div", "content": [
+                              {"component": "div",
+                               "props": {"class": "text-caption text-medium-emphasis"},
+                               "text": title},
+                              {"component": "div",
+                               "props": {"class": "text-h6 font-weight-bold"},
+                               "text": value},
+                          ]},
+                      ]},
+                 ]},
+            ],
+        }
+
+    @staticmethod
+    def _fmt_speed(value: Any) -> str:
+        try:
+            n = float(value or 0)
+        except Exception:
+            n = 0.0
+        for unit in ("B/s", "KB/s", "MB/s", "GB/s"):
+            if n < 1024 or unit == "GB/s":
+                return (f"{n:.0f} {unit}" if unit == "B/s" else f"{n:.2f} {unit}")
+            n /= 1024.0
+        return f"{n:.2f} GB/s"
 
     # ------------------------------------------------------------------ 采集
     def _collect(self) -> Tuple[List[dict], List[str]]:
