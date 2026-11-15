@@ -89,7 +89,7 @@ class DownloadMonitor(_PluginBase):
     plugin_desc = "实时监控 qBittorrent / Transmission 全部任务，支持多字段排序"
     plugin_icon = ""
     plugin_color = "#1976D2"
-    plugin_version = "1.0.2"
+    plugin_version = "1.0.3"
     plugin_author = "虾虾"
     author_url = "https://github.com/meeryang/MoviePilot-Plugins"
     plugin_config_prefix = "downloadmonitor_"
@@ -209,7 +209,7 @@ class DownloadMonitor(_PluginBase):
             apikey = settings.API_TOKEN
         except Exception:  # noqa: BLE001
             apikey = ""
-        url = f"api/v1/plugin/DownloadMonitor/ui?apikey={apikey}"
+        url = f"/api/v1/plugin/DownloadMonitor/ui?apikey={apikey}"
         onclick = (
             "function(e) { window.open('" + url + "', '_blank'); }"
         )
@@ -737,7 +737,7 @@ function load() {
       '<div class="err">缺少 apikey，请从 MoviePilot 插件页点「打开监控面板」进入。</div>';
     return;
   }
-  var url = "api/v1/plugin/DownloadMonitor/tasks?apikey=" + encodeURIComponent(apikey) +
+  var url = "/api/v1/plugin/DownloadMonitor/tasks?apikey=" + encodeURIComponent(apikey) +
             "&sort=" + encodeURIComponent(sortKey) +
             "&order=" + encodeURIComponent(sortOrder) +
             "&keyword=" + encodeURIComponent(document.getElementById("kw").value || "") +
