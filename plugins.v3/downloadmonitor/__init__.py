@@ -89,7 +89,7 @@ class DownloadMonitor(_PluginBase):
     plugin_desc = "实时监控 qBittorrent / Transmission 全部任务，支持多字段排序"
     plugin_icon = ""
     plugin_color = "#1976D2"
-    plugin_version = "1.0.3"
+    plugin_version = "2.1.0"
     plugin_author = "虾虾"
     author_url = "https://github.com/meeryang/MoviePilot-Plugins"
     plugin_config_prefix = "downloadmonitor_"
@@ -101,6 +101,10 @@ class DownloadMonitor(_PluginBase):
     _downloaders: List[str] = []
     _default_sort: str = "added"
     _default_order: str = "desc"
+    # 桥接 MP 原生「下载管理」：列出并管理全部下载器的全部任务
+    _bridge_native: bool = True
+    # 最近一次 init_plugin 的实例（reload 后线程/补丁仍取最新配置）
+    _inst: Any = None
     # 仪表板短时缓存（类级，避免频繁打下载器）
     _cache: Optional[List[dict]] = None
     _cache_ts: float = 0.0
@@ -112,8 +116,10 @@ class DownloadMonitor(_PluginBase):
         self._downloaders = []
         self._default_sort = "added"
         self._default_order = "desc"
+        self._bridge_native = True
         if config:
             self._enabled = bool(config.get("enabled"))
+            self._bridge_native = bool(config.get("bridge_native", True))
             try:
                 self._interval = max(1, min(120, int(config.get("interval") or 5)))
             except Exception:
@@ -126,12 +132,201 @@ class DownloadMonitor(_PluginBase):
                 self._default_sort = config["default_sort"]
             if config.get("default_order") in ("asc", "desc"):
                 self._default_order = config["default_order"]
+        DownloadMonitor._inst = self
+        try:
+            if self._enabled and self._bridge_native:
+                self._install_bridge()
+            else:
+                self._uninstall_bridge()
+        except Exception as err:  # noqa: BLE001
+            logger.error(f"【{self.plugin_name}】桥接原生下载管理失败：{err}")
+
+    # ------------------------------------------------- 原生「下载管理」桥接
+    @staticmethod
+    def _downloader_modules(method: str) -> List[Any]:
+        """取所有实现了该方法的运行中下载器模块。
+
+        原生 `run_module` 只采用「第一个」返回结果的模块，配了 qB + TR 也只看得到 qB，
+        所以要自己枚举全部模块再合并。
+        """
+        try:
+            from app.application.module import get_module_manager
+            return list(get_module_manager().get_running_modules(method) or [])
+        except Exception as err:  # noqa: BLE001
+            logger.debug(f"【下载任务监控】枚举下载器模块失败：{err}")
+            return []
+
+    @staticmethod
+    def _downloader_names() -> List[str]:
+        """取全部下载器实例名（如 qbittorrent / transmisson）。
+
+        注意：模块方法传 `downloader=None` 时走 `get_instance(None)`，多实例或未设默认实例
+        会返回 None 直接不执行 —— 所以广播操作必须按实例名逐个调用。
+        """
+        try:
+            from app.sdk.services import DownloaderHelper
+            return [str(k) for k in (DownloaderHelper().get_configs() or {}).keys()]
+        except Exception as err:  # noqa: BLE001
+            logger.debug(f"【下载任务监控】读取下载器实例名失败：{err}")
+            return []
+
+    def _install_bridge(self) -> None:
+        """让 MP 原生「下载管理」看到并管理全部下载器的全部任务。
+
+        原生链路有两处限制：
+        1) `list_torrents` / `start_torrents` / `stop_torrents` / `remove_torrents`
+           都经 `run_module` 分发，只取第一个模块的结果 → 多下载器只剩一个。
+        2) `DownloadTaskService.downloading()` 固定 `status=DOWNLOADING` 且
+           `include_all_tags=False` → 只列带系统标签的下载中任务。
+
+        这里在未指定下载器时合并全部模块、全部状态，并把暂停/开始/删除广播到所有模块；
+        指定了下载器（`name`/`downloader` 非空）时完全走原生逻辑，不改变原有行为。
+        """
+        from app.chain.download import DownloadChain
+        if getattr(DownloadChain, "_dm_bridge_installed", False):
+            return
+        plugin = self
+        prev_downloading = DownloadChain.downloading
+        prev_start = DownloadChain.start_torrents
+        prev_stop = DownloadChain.stop_torrents
+        prev_remove = DownloadChain.remove_torrents
+
+        def _enabled() -> bool:
+            inst = DownloadMonitor._inst or plugin
+            return bool(getattr(inst, "_enabled", False)
+                        and getattr(inst, "_bridge_native", True))
+
+        def _annotate(chain_self: Any, rows: List[Any]) -> List[Any]:
+            """补全 MP 下载历史归属（媒体/站点/用户），失败不影响列表本身。"""
+            try:
+                hashes = [r.hash for r in rows if getattr(r, "hash", None)]
+                repo = getattr(chain_self, "download_history_repository", None)
+                hmap = repo.get_by_hashes(hashes) if (repo and hashes) else {}
+            except Exception:
+                return rows
+            if not hmap:
+                return rows
+            try:
+                from app.schemas.transfer import DownloadTaskMedia
+            except Exception:
+                return rows
+            for row in rows:
+                hist = hmap.get(getattr(row, "hash", None))
+                if not hist:
+                    continue
+                try:
+                    row.media = DownloadTaskMedia(
+                        media_source=getattr(hist, "media_source", None),
+                        media_id=getattr(hist, "media_id", None),
+                        type=getattr(hist, "type", None),
+                        title=getattr(hist, "title", None),
+                        season=getattr(hist, "seasons", None),
+                        episode=getattr(hist, "episodes", None),
+                        image=getattr(hist, "poster", None),
+                        poster=getattr(hist, "poster", None),
+                        backdrop=getattr(hist, "image", None),
+                    )
+                    row.site_name = getattr(hist, "torrent_site", None)
+                    row.userid = getattr(hist, "userid", None)
+                    row.username = getattr(hist, "username", None)
+                except Exception:
+                    continue
+            return rows
+
+        def patched_downloading(chain_self: Any, name: Any = None, **kwargs: Any) -> Any:
+            if name or not _enabled():
+                return prev_downloading(chain_self, name, **kwargs)
+            rows: List[Any] = []
+            seen = set()
+            for mod in DownloadMonitor._downloader_modules("list_torrents"):
+                got = None
+                try:
+                    got = mod.list_torrents(status=None, hashs=None, downloader=None,
+                                            include_all_tags=True)
+                except TypeError:
+                    try:
+                        got = mod.list_torrents(status=None)
+                    except Exception:
+                        got = None
+                except Exception as err:  # noqa: BLE001
+                    logger.debug(f"【下载任务监控】读取模块任务失败：{err}")
+                    got = None
+                for row in got or []:
+                    key = (getattr(row, "downloader", None), getattr(row, "hash", None))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    rows.append(row)
+            if not rows:
+                return prev_downloading(chain_self, name, **kwargs)
+            return _annotate(chain_self, rows)
+
+        def _broadcast(chain_self: Any, method: str, prev: Any,
+                       args: tuple, kwargs: dict) -> Any:
+            if kwargs.get("downloader") or not _enabled():
+                return prev(chain_self, *args, **kwargs)
+            names = DownloadMonitor._downloader_names()
+            if not names:
+                return prev(chain_self, *args, **kwargs)
+            ok = False
+            results = []
+            for name in names:
+                call_kwargs = dict(kwargs)
+                call_kwargs["downloader"] = name
+                try:
+                    rv = prev(chain_self, *args, **call_kwargs)
+                    results.append(f"{name}={rv}")
+                    if rv:
+                        ok = True
+                except Exception as err:  # noqa: BLE001
+                    results.append(f"{name}=E({err})")
+            logger.info(f"【{self.plugin_name}】广播 {method} {args} "
+                        f"{results} → {ok}")
+            return ok
+
+        def patched_start(chain_self: Any, *args: Any, **kwargs: Any) -> Any:
+            return _broadcast(chain_self, "start_torrents", prev_start, args, kwargs)
+
+        def patched_stop(chain_self: Any, *args: Any, **kwargs: Any) -> Any:
+            return _broadcast(chain_self, "stop_torrents", prev_stop, args, kwargs)
+
+        def patched_remove(chain_self: Any, *args: Any, **kwargs: Any) -> Any:
+            return _broadcast(chain_self, "remove_torrents", prev_remove, args, kwargs)
+
+        DownloadChain.downloading = patched_downloading
+        DownloadChain.start_torrents = patched_start
+        DownloadChain.stop_torrents = patched_stop
+        DownloadChain.remove_torrents = patched_remove
+        DownloadChain._dm_bridge_installed = True
+        DownloadChain._dm_bridge_prev = {
+            "downloading": prev_downloading,
+            "start_torrents": prev_start,
+            "stop_torrents": prev_stop,
+            "remove_torrents": prev_remove,
+        }
+        logger.info(f"【{self.plugin_name}】已桥接原生下载管理：全部下载器 + 全部状态")
+
+    def _uninstall_bridge(self) -> None:
+        """还原原生方法，避免插件停用后仍被补丁接管。"""
+        try:
+            from app.chain.download import DownloadChain
+        except Exception:
+            return
+        prev = getattr(DownloadChain, "_dm_bridge_prev", None)
+        if not prev:
+            return
+        for attr, fn in prev.items():
+            setattr(DownloadChain, attr, fn)
+        DownloadChain._dm_bridge_installed = False
+        DownloadChain._dm_bridge_prev = {}
+        logger.info(f"【{self.plugin_name}】已解除原生下载管理桥接")
 
     def get_state(self) -> bool:
         return self._enabled
 
     def stop_service(self) -> None:
-        """无后台线程需要停止。"""
+        """插件停用/卸载时还原原生方法。"""
+        self._uninstall_bridge()
         return None
 
     # ------------------------------------------------------------------ 配置表单
@@ -171,25 +366,36 @@ class DownloadMonitor(_PluginBase):
         rows = [
             {"component": "VRow", "content": [
                 col(4, switch("enabled", "启用插件")),
+                col(4, switch("bridge_native", "桥接原生下载管理")),
                 col(4, field("interval", "面板刷新间隔(秒)", 5, "number", "1~120 秒，默认 5")),
-                col(4, field("default_sort", "默认排序字段", "added", "text",
-                             "可选：" + "/".join(SORT_LABELS.keys()))),
-            ]},
-            {"component": "VRow", "content": [
-                col(4, field("downloaders", "监控的下载器(逗号分隔)", "留空=全部", "text",
-                             "填下载器名称，多个用英文逗号分隔")),
-                col(4, field("default_order", "默认排序方向", "desc", "text", "asc 升序 / desc 降序")),
-                col(4, field("rows_per_page", "每页条数", 100, "number", "面板分页大小")),
             ]},
             {"component": "VRow", "content": [
                 col(12, {"component": "VAlert",
                          "props": {"type": "info", "variant": "tonal",
-                                   "text": "插件只读，不会修改或暂停任何任务。"
-                                           "在插件详情页点「打开监控面板」即可实时查看全部任务。"}}),
+                                   "text": "开启「桥接原生下载管理」后，MoviePilot 自带的"
+                                           "「下载管理」页面会列出全部下载器（qB + TR）的全部任务"
+                                           "（含外部添加、无标签、做种完成的任务），"
+                                           "并可直接暂停 / 开始 / 删除；关闭则恢复 MP 原生行为。"}}),
+            ]},
+            {"component": "VRow", "content": [
+                col(3, field("downloaders", "监控的下载器(逗号分隔)", "留空=全部", "text",
+                             "填下载器名称，多个用英文逗号分隔")),
+                col(3, field("default_sort", "面板默认排序字段", "added", "text",
+                             "可选：" + "/".join(SORT_LABELS.keys()))),
+                col(3, field("default_order", "默认排序方向", "desc", "text", "asc 升序 / desc 降序")),
+                col(3, field("rows_per_page", "每页条数", 100, "number", "面板分页大小")),
+            ]},
+            {"component": "VRow", "content": [
+                col(12, {"component": "VAlert",
+                         "props": {"type": "success", "variant": "tonal",
+                                   "text": "原生桥接：MP「下载管理」页显示全部下载器的全部任务并支持"
+                                           "暂停/开始/删除。插件详情页另有「打开监控面板」，"
+                                           "可多字段排序与搜索（面板本身只读）。"}}),
             ]},
         ]
         defaults = {
             "enabled": False,
+            "bridge_native": True,
             "interval": 5,
             "downloaders": [],
             "default_sort": "added",
