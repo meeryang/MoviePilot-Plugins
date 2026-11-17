@@ -89,7 +89,7 @@ class DownloadMonitor(_PluginBase):
     plugin_desc = "实时监控 qBittorrent / Transmission 全部任务，支持多字段排序"
     plugin_icon = ""
     plugin_color = "#1976D2"
-    plugin_version = "2.2.0"
+    plugin_version = "2.4.0"
     plugin_author = "虾虾"
     author_url = "https://github.com/meeryang/MoviePilot-Plugins"
     plugin_config_prefix = "downloadmonitor_"
@@ -105,6 +105,9 @@ class DownloadMonitor(_PluginBase):
     _bridge_native: bool = True
     # 最近一次 init_plugin 的实例（reload 后线程/补丁仍取最新配置）
     _inst: Any = None
+    # hash → 所属下载器 的短时缓存，用于纠正 MP 传错的 downloader
+    _hash_owner: Dict[str, str] = {}
+    _hash_owner_ts: float = 0.0
     # 仪表板短时缓存（类级，避免频繁打下载器）
     _cache: Optional[List[dict]] = None
     _cache_ts: float = 0.0
@@ -190,6 +193,8 @@ class DownloadMonitor(_PluginBase):
         prev_start = DownloadChain.start_torrents
         prev_stop = DownloadChain.stop_torrents
         prev_remove = DownloadChain.remove_torrents
+        prev_tag = DownloadChain.set_torrents_tag
+        prev_update = DownloadChain.update_torrent
 
         def _enabled() -> bool:
             inst = DownloadMonitor._inst or plugin
@@ -271,6 +276,58 @@ class DownloadMonitor(_PluginBase):
                 return prev_downloading(chain_self, name, **kwargs)
             return _annotate(chain_self, rows)
 
+        def _owner_of(chain_self: Any, hash_str: Optional[str]) -> Optional[str]:
+            """查某个 hash 真正属于哪个下载器。
+
+            MP 的 `DownloadTaskMutationService` 会自己「猜」下载器，猜错时把请求发给 qB，
+            而 qB 对不存在的 hash 也会返回 success —— 于是界面提示改成功、任务实际没变。
+            这里建一张 hash → 下载器 的短时映射来纠正。
+            """
+            if not hash_str:
+                return None
+            now = time.time()
+            cache = DownloadMonitor._hash_owner
+            if (not cache) or (now - DownloadMonitor._hash_owner_ts > 120):
+                mapping: Dict[str, str] = {}
+                for name in DownloadMonitor._downloader_names():
+                    try:
+                        got = chain_self.list_torrents(hashs=None, downloader=name,
+                                                       include_all_tags=True)
+                    except Exception:
+                        got = None
+                    for row in got or []:
+                        h = getattr(row, "hash", None)
+                        if h:
+                            mapping[str(h)] = name
+                DownloadMonitor._hash_owner = mapping
+                DownloadMonitor._hash_owner_ts = now
+                cache = mapping
+            return cache.get(str(hash_str))
+
+        def _pick_hash(kwargs: Dict[str, Any]) -> Optional[str]:
+            for key in ("hash_string", "hash_str", "hash"):
+                val = kwargs.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+            hashs = kwargs.get("hashs")
+            if isinstance(hashs, str) and hashs.strip():
+                return hashs.strip()
+            if isinstance(hashs, (list, tuple)) and len(hashs) == 1:
+                return str(hashs[0])
+            return None
+
+        def _redirect(chain_self: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+            """把 MP 猜错的 downloader 纠正为 hash 真正所属的下载器。"""
+            given = kwargs.get("downloader")
+            owner = _owner_of(chain_self, _pick_hash(kwargs))
+            if owner and owner != given:
+                fixed = dict(kwargs)
+                fixed["downloader"] = owner
+                logger.info(f"【{self.plugin_name}】纠正下载器 {given} → {owner} "
+                            f"(hash={str(_pick_hash(kwargs))[:12]})")
+                return fixed
+            return kwargs
+
         def _broadcast(chain_self: Any, method: str, prev: Any,
                        args: tuple, kwargs: dict) -> Any:
             if kwargs.get("downloader") or not _enabled():
@@ -295,26 +352,68 @@ class DownloadMonitor(_PluginBase):
             return ok
 
         def patched_start(chain_self: Any, *args: Any, **kwargs: Any) -> Any:
-            return _broadcast(chain_self, "start_torrents", prev_start, args, kwargs)
+            return _broadcast(chain_self, "start_torrents", prev_start, args,
+                              _redirect(chain_self, kwargs))
 
         def patched_stop(chain_self: Any, *args: Any, **kwargs: Any) -> Any:
-            return _broadcast(chain_self, "stop_torrents", prev_stop, args, kwargs)
+            return _broadcast(chain_self, "stop_torrents", prev_stop, args,
+                              _redirect(chain_self, kwargs))
 
         def patched_remove(chain_self: Any, *args: Any, **kwargs: Any) -> Any:
-            return _broadcast(chain_self, "remove_torrents", prev_remove, args, kwargs)
+            return _broadcast(chain_self, "remove_torrents", prev_remove, args,
+                              _redirect(chain_self, kwargs))
+
+        def patched_set_tag(chain_self: Any, *args: Any, **kwargs: Any) -> Any:
+            """标签设置同样按实例名广播，否则 qB 先返回会让 TR 任务静默失败。"""
+            return _broadcast(chain_self, "set_torrents_tag", prev_tag, args,
+                              _redirect(chain_self, kwargs))
+
+        def patched_update_torrent(chain_self: Any, *args: Any, **kwargs: Any) -> Any:
+            """限速/Tracker/保存目录/分类/分享率修改：按实例名广播并合并各字段结果。"""
+            if not _enabled():
+                return prev_update(chain_self, *args, **kwargs)
+            kwargs = _redirect(chain_self, kwargs)
+            if kwargs.get("downloader"):
+                return prev_update(chain_self, *args, **kwargs)
+            names = DownloadMonitor._downloader_names()
+            if not names:
+                return prev_update(chain_self, *args, **kwargs)
+            merged: Dict[str, bool] = {}
+            results = []
+            for name in names:
+                call_kwargs = dict(kwargs)
+                call_kwargs["downloader"] = name
+                try:
+                    rv = prev_update(chain_self, *args, **call_kwargs) or {}
+                except Exception as err:  # noqa: BLE001
+                    results.append(f"{name}=E({err})")
+                    continue
+                results.append(f"{name}={rv}")
+                if isinstance(rv, dict):
+                    for key, val in rv.items():
+                        if val:
+                            merged[key] = True
+                        else:
+                            merged.setdefault(key, False)
+            logger.info(f"【{self.plugin_name}】广播 update_torrent {results} → {merged}")
+            return merged or None
 
         DownloadChain.downloading = patched_downloading
         DownloadChain.start_torrents = patched_start
         DownloadChain.stop_torrents = patched_stop
         DownloadChain.remove_torrents = patched_remove
+        DownloadChain.set_torrents_tag = patched_set_tag
+        DownloadChain.update_torrent = patched_update_torrent
         DownloadChain._dm_bridge_installed = True
         DownloadChain._dm_bridge_prev = {
             "downloading": prev_downloading,
             "start_torrents": prev_start,
             "stop_torrents": prev_stop,
             "remove_torrents": prev_remove,
+            "set_torrents_tag": prev_tag,
+            "update_torrent": prev_update,
         }
-        logger.info(f"【{self.plugin_name}】已桥接原生下载管理：全部下载器 + 全部状态")
+        logger.info(f"【{self.plugin_name}】已桥接原生下载管理：全部下载器 + 全部状态 + 标签/限速")
 
     def _uninstall_bridge(self) -> None:
         """还原原生方法，避免插件停用后仍被补丁接管。"""
