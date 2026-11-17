@@ -22,6 +22,7 @@ import os
 import time
 import json
 import re
+import unicodedata
 import requests
 from typing import List, Optional, Tuple
 
@@ -70,7 +71,7 @@ class LxMusicDownloader(_PluginBase):
     plugin_name = "LX音乐下载"
     plugin_desc = "音乐专辑订阅联动：订阅-音乐新增专辑时按网易云/QQ 搜索整张专辑并经 LX音乐下载；支持音质选择"
     plugin_icon = "https://gitee.com/makimayang/obsidian/raw/main/icon.png"
-    plugin_version = "3.5"
+    plugin_version = "3.7"
     plugin_author = "虾虾"
     author_url = ""
     plugin_config_prefix = "lxmusicdownloader_"
@@ -187,6 +188,13 @@ class LxMusicDownloader(_PluginBase):
                 "methods": ["GET"],
                 "summary": "专辑搜索测试",
                 "description": "按专辑名依次调用网易云/QQ 搜索专辑并列出曲目",
+            },
+            {
+                "path": "/artist_album_test",
+                "endpoint": self.api_artist_album_test,
+                "methods": ["GET"],
+                "summary": "歌手优先流程测试",
+                "description": "按歌手名+专辑名走完整链路：搜歌手 → 核对演唱者 → 进歌手全部专辑 → 找专辑 → 列曲目",
             },
             {
                 "path": "/music_subs",
@@ -807,7 +815,14 @@ class LxMusicDownloader(_PluginBase):
                 keep.append(flag.replace(" ", ""))
         # 再删除所有括号内容（不影响已抽取的标记）
         t = re.sub(r"[（(\[【].*?[）)\]】]", "", t)
-        t = re.sub(r"[\s\-_·．.,，。!！?？'\"”“:：;；/\\|&+]", "", t)
+        # 统一 Unicode 形式（全角→半角），再把「非字母数字」全部去掉。
+        # 只维护 ASCII 标点白名单是不够的：订阅名常用弯撇号（Writer’s）而音源用直撇号（Writer's），
+        # 白名单漏掉 ’ 就会明明有这张专辑却匹配不上。
+        try:
+            t = unicodedata.normalize("NFKC", t)
+        except Exception:
+            pass
+        t = "".join(ch for ch in t if ch.isalnum())
         t = t.strip()
         if keep:
             t += "|" + "|".join(sorted(keep))
@@ -1116,6 +1131,150 @@ class LxMusicDownloader(_PluginBase):
                 logger.info(f"【{self.plugin_name}】进专辑成功：{detail.get('name')} - "
                             f"{detail.get('artistName')}（{src}，{total} 首）")
                 return src, str(aid), detail
+        return None, None, None
+
+    # ---------- 歌手优先流程：搜歌手 → 核对演唱者 → 进歌手全部专辑 → 找专辑 ----------
+    def _artist_search(self, artist: str, src: str) -> Optional[dict]:
+        """搜索歌手条目。src 用音源代号：wy(网易云) / tx(QQ)。
+        返回 {"id": 歌手ID, "name": 线上歌手名}；演唱者名称不匹配则返回 None。
+        注意：必须「完全相等」才算命中，子串匹配会把同名翻唱/他人条目放进来。
+        """
+        if not artist:
+            return None
+        arts: List[dict] = []
+        try:
+            if src == "wy":
+                r = requests.get(
+                    "https://music.163.com/api/search/get",
+                    params={"s": artist, "type": 100, "limit": 10, "offset": 0},
+                    headers={**self._h5(), "Referer": "https://music.163.com/"},
+                    timeout=15,
+                )
+                if r.status_code != 200:
+                    return None
+                arts = ((r.json() or {}).get("result") or {}).get("artists") or []
+            elif src == "tx":
+                r = requests.get(
+                    "https://c.y.qq.com/soso/fcgi-bin/client_search_cp",
+                    params={"w": artist, "t": 9, "format": "json", "p": 1, "n": 10},
+                    headers={**self._h5(), "Referer": "https://y.qq.com/"},
+                    timeout=15,
+                )
+                if r.status_code != 200:
+                    return None
+                arts = (((json.loads((r.text or "").strip()).get("data") or {})
+                         .get("singer") or {}).get("list")) or []
+        except Exception as e:
+            logger.info(f"【{self.plugin_name}】{src} 搜歌手「{artist}」异常：{e}")
+            return None
+        for a in arts:
+            if not isinstance(a, dict):
+                continue
+            name = (a.get("name") or a.get("singerName") or "").strip()
+            ident = a.get("id") or a.get("singerMID") or a.get("singermid")
+            if not name or not ident:
+                continue
+            # 核对演唱者名称：拆分后必须有一项完全相等
+            if self._singer_match(name, artist):
+                return {"id": str(ident), "name": name}
+        logger.info(f"【{self.plugin_name}】{src} 搜到 {len(arts)} 个歌手但演唱者名对不上「{artist}」")
+        return None
+
+    def _artist_albums(self, artist_id: str, src: str) -> List[dict]:
+        """进入歌手条目 → 该歌手的全部专辑 [{id, name, size, artist}]"""
+        out: List[dict] = []
+        try:
+            if src == "wy":
+                for offset in (0, 100):
+                    r = requests.get(
+                        f"https://music.163.com/api/artist/albums/{artist_id}",
+                        params={"limit": 100, "offset": offset},
+                        headers={**self._h5(), "Referer": "https://music.163.com/"},
+                        timeout=20,
+                    )
+                    if r.status_code != 200:
+                        break
+                    hot = (r.json() or {}).get("hotAlbums") or []
+                    for a in hot:
+                        out.append({"id": str(a.get("id") or ""),
+                                    "name": a.get("name") or "",
+                                    "size": int(a.get("size") or 0),
+                                    "artist": (a.get("artist") or {}).get("name") or ""})
+                    if len(hot) < 100:
+                        break
+            elif src == "tx":
+                # 参数名必须是全小写 singermid（写 singerMid 会返回 code=400、专辑数 0）
+                r = requests.get(
+                    "https://c.y.qq.com/v8/fcg-bin/fcg_v8_singer_album.fcg",
+                    params={"singermid": artist_id, "format": "json", "begin": 0, "num": 100},
+                    headers={**self._h5(), "Referer": "https://y.qq.com/"},
+                    timeout=20,
+                )
+                if r.status_code == 200:
+                    lst = ((r.json() or {}).get("data") or {}).get("list") or []
+                    for a in lst:
+                        out.append({"id": str(a.get("albumMID") or ""),
+                                    "name": a.get("albumName") or "",
+                                    "size": int(a.get("song_count") or 0),
+                                    "artist": a.get("singerName") or ""})
+        except Exception as e:
+            logger.info(f"【{self.plugin_name}】{src} 取歌手「{artist_id}」专辑列表异常：{e}")
+        return [x for x in out if x.get("id") and x.get("name")]
+
+    def find_album_via_artist(self, album_name: str, artist: str = "",
+                              expect_tracks: Optional[int] = None):
+        """歌手优先找专辑：
+        ① 搜索歌手名称 ② 核对演唱者名称 ③ 进歌手条目取全部专辑
+        ④ 在专辑列表里查找并核对专辑名（+曲目数） ⑤ 进专辑拿整张曲目
+        返回 (source, album_id, detail) 或 (None, None, None)
+        detail 里的 list 就是可直接入队的 songInfo。
+        """
+        if not album_name or not artist:
+            return None, None, None
+        order = [x.strip().lower() for x in (self._album_order or "netease,qq").split(",") if x.strip()]
+        if not order:
+            order = ["netease", "qq"]
+        src_map = {"netease": "wy", "qq": "tx"}
+        for name in order:
+            src = src_map.get(name)
+            if not src:
+                continue
+            hit = self._artist_search(artist, src)
+            if not hit:
+                continue
+            albums = self._artist_albums(hit["id"], src)
+            if not albums:
+                logger.info(f"【{self.plugin_name}】{src} 歌手「{hit['name']}」拿不到专辑列表")
+                continue
+            # 先精确专辑名，再容忍包含关系
+            exact = [x for x in albums if self._album_key(x["name"]) == self._album_key(album_name)]
+            loose = [x for x in albums
+                     if x not in exact and self._album_match(x["name"], album_name)]
+            if not exact and not loose:
+                logger.info(f"【{self.plugin_name}】{src} 歌手「{hit['name']}」名下 {len(albums)} 张专辑"
+                            f"里没有《{album_name}》")
+                continue
+            for cand in (exact + loose):
+                size = int(cand.get("size") or 0)
+                if expect_tracks and size and abs(size - int(expect_tracks)) > 2:
+                    logger.info(f"【{self.plugin_name}】{src} 专辑《{cand['name']}》曲目 {size} "
+                                f"与订阅 {expect_tracks} 不符，跳过")
+                    continue
+                if cand.get("artist") and not self._singer_match(cand["artist"], artist):
+                    logger.info(f"【{self.plugin_name}】{src} 专辑《{cand['name']}》歌手 "
+                                f"「{cand['artist']}」与「{artist}」不符，跳过")
+                    continue
+                detail = self.album_songs(cand["id"], src)
+                if not detail:
+                    continue
+                total = detail.get("total") or len(detail.get("list") or [])
+                if not self._tracks_ok(detail["list"], expect_tracks):
+                    logger.info(f"【{self.plugin_name}】{src}/{cand['id']} 曲目数 {total} "
+                                f"与预期 {expect_tracks} 不符，继续找")
+                    continue
+                logger.info(f"【{self.plugin_name}】歌手流程命中：{hit['name']} → "
+                            f"《{cand['name']}》（{src}，{total} 首）")
+                return src, cand["id"], detail
         return None, None, None
 
     def _find_song_info(self, track: dict) -> Optional[dict]:
@@ -2041,15 +2200,34 @@ class LxMusicDownloader(_PluginBase):
                 except Exception:
                     artist = ""
             kw = f"{a['name']} {artist}".strip()
-            try:
-                _src, _real, tracks = self.find_album(kw, expect)
-            except Exception as e:
-                notes.append(f"{a['name']}: 查专辑异常 {e}")
-                continue
-            if not tracks:
-                notes.append(f"{a['name']}: 未找到专辑曲目表")
-                continue
-            real_tracks = [t for t in tracks if self._is_real_track(t.get("name") or "")]
+            # ===== 流程一：歌手优先（搜歌手 → 核对演唱者 → 进歌手全部专辑 → 找专辑）=====
+            detail, hit_src = None, None
+            if artist:
+                try:
+                    hit_src, _aid, detail = self.find_album_via_artist(a["name"], artist, expect)
+                except Exception as e:
+                    notes.append(f"{a['name']}: 歌手流程异常 {e}")
+                    detail = None
+            if detail:
+                # detail["list"] 就是可直接入队的 songInfo，无需再逐曲解析
+                real_tracks = [{"name": x.get("name") or "",
+                                "artist": x.get("singer") or artist,
+                                "_song": x}
+                               for x in (detail.get("list") or [])
+                               if self._is_real_track(x.get("name") or "")]
+                notes.append(f"{a['name']}: 歌手「{artist}」→《{detail.get('name') or a['name']}》"
+                             f"（{hit_src}，{len(real_tracks)} 首）")
+            else:
+                # ===== 流程二：兜底（按「专辑名 歌手」直接搜专辑）=====
+                try:
+                    _src, _real, tracks = self.find_album(kw, expect)
+                except Exception as e:
+                    notes.append(f"{a['name']}: 查专辑异常 {e}")
+                    continue
+                if not tracks:
+                    notes.append(f"{a['name']}: 未找到专辑曲目表")
+                    continue
+                real_tracks = [t for t in tracks if self._is_real_track(t.get("name") or "")]
             # 版本不符保护：订阅 17 首却查到 40 首（如 Abbey Road 命中 Super Deluxe Edition），
             # 说明匹配到了豪华版/加长版 —— 直接跳过，否则会把一堆非订阅曲目也下下来。
             if expect and len(real_tracks) > expect:
@@ -2075,19 +2253,44 @@ class LxMusicDownloader(_PluginBase):
         # 曲目表里只有 name/artist，必须逐曲解析出 songmid 才能入队，否则 queue_download 全跳过
         picked = []
         for t in missing[:max_fill]:
-            try:
-                song = self._find_song_info(t)
-            except Exception:
-                song = None
+            song = t.get("_song")          # 歌手流程已带可直接入队的 songInfo
+            if not song:
+                try:
+                    song = self._find_song_info(t)
+                except Exception:
+                    song = None
             if song:
                 picked.append(song)
-            time.sleep(0.3)
+            time.sleep(0.3 if not t.get("_song") else 0)
         if not picked:
             logger.info(f"【{self.plugin_name}】订阅专辑补全：{detail} → 曲目无法解析音源")
             return 0, f"{detail}；定位到缺曲但全部无法解析音源"
         n, msg = self.queue_download_with_fallback(picked, self._quality)
         logger.info(f"【{self.plugin_name}】订阅专辑补全：{detail} → 解析 {len(picked)} 首，提交 {n} 首")
-        return n, f"{detail}；已提交 {n} 首补全（{msg}）"
+        # 提交队列后收尾：搬进音乐库 → 清理小文件 → 清空 cache/_open
+        tail = ""
+        try:
+            _mv, _cl, _mmsg = self.promote_to_music()
+            if _mv or _cl:
+                tail += f"；入库 {_mv} 个"
+                logger.info(f"【{self.plugin_name}】补全后入库：{_mmsg}")
+        except Exception as e:
+            logger.error(f"【{self.plugin_name}】补全后入库异常：{e}")
+        try:
+            _sn, _smsg = self.clean_small_files()
+            if _sn:
+                tail += f"；清理小文件 {_sn} 个"
+                logger.info(f"【{self.plugin_name}】补全后清理小文件：{_smsg}")
+        except Exception as e:
+            logger.error(f"【{self.plugin_name}】补全后清理小文件异常：{e}")
+        try:
+            _on, _omsg = self.clear_open_cache()
+            if _on:
+                tail += f"；清空 cache/_open {_on} 个"
+                logger.info(f"【{self.plugin_name}】补全后清空 _open：{_omsg}")
+        except Exception as e:
+            logger.error(f"【{self.plugin_name}】补全后清空 _open 异常：{e}")
+        return n, f"{detail}；已提交 {n} 首补全（{msg}）{tail}"
 
     # ---------------- API 端点实现 ----------------
 
@@ -2164,6 +2367,43 @@ class LxMusicDownloader(_PluginBase):
         except Exception as e:
             logger.error(f"【{self.plugin_name}】手动轮询异常：{e}")
             return {"success": False, "message": f"运行失败：{e}"}
+
+    def api_artist_album_test(self, artist: str = "", album: str = "", expect: int = 0):
+        """歌手优先流程测试端点：完整走一遍链路并返回每一步的结果。"""
+        steps: List[dict] = []
+        if not artist or not album:
+            return {"success": False, "message": "请同时传 artist 与 album 参数", "data": []}
+        exp = int(expect) if str(expect).isdigit() and int(expect) > 0 else None
+        for src in ("wy", "tx"):
+            sname = "网易云" if src == "wy" else "QQ"
+            hit = self._artist_search(artist, src)
+            if not hit:
+                steps.append({"源": sname, "搜索歌手": "❌ 演唱者名对不上或无结果"})
+                continue
+            steps.append({"源": sname, "搜索歌手": f"✅ {hit['name']}（id={hit['id']}）"})
+            albums = self._artist_albums(hit["id"], src)
+            steps.append({"源": sname, "歌手全部专辑": f"{len(albums)} 张"})
+            cand = [x for x in albums
+                    if self._album_key(x["name"]) == self._album_key(album)] or \
+                   [x for x in albums if self._album_match(x["name"], album)]
+            if not cand:
+                steps.append({"源": sname, "查找专辑": f"❌ 名下无《{album}》"})
+                continue
+            steps.append({"源": sname,
+                          "查找专辑": "；".join(f"《{c['name']}》{c['size'] or '?'}首/歌手{c['artist']}"
+                                                for c in cand[:4])})
+            detail = self.album_songs(cand[0]["id"], src)
+            if not detail:
+                steps.append({"源": sname, "进专辑": "❌ albumSongs 失败"})
+                continue
+            names = [x.get("name") or "" for x in (detail.get("list") or [])]
+            steps.append({"源": sname,
+                          "进专辑": f"✅《{detail.get('name')}》{detail.get('artistName')} "
+                                    f"{len(names)} 首（曲目数校验 "
+                                    f"{'通过' if self._tracks_ok(detail['list'], exp) else '不通过'}）",
+                          "曲目": names[:10]})
+            return {"success": True, "message": "链路走通", "data": steps}
+        return {"success": False, "message": "两个源都没走通，将走兜底流程", "data": steps}
 
     def api_music_subs(self):
         """查看音乐订阅联动状态"""
