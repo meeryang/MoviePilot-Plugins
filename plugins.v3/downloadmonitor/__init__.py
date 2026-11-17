@@ -6,8 +6,13 @@
 2. 概览：插件详情页与首页仪表板展示任务统计。
 """
 
+import json
+import re
+import threading
 import time
+import unicodedata
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.sdk.logging import logger
@@ -64,7 +69,7 @@ class DownloadMonitor(_PluginBase):
     plugin_desc = "把全部下载器的全部任务桥接进 MoviePilot 原生下载管理"
     plugin_icon = ""
     plugin_color = "#1976D2"
-    plugin_version = "3.0.0"
+    plugin_version = "3.1.4"
     plugin_author = "虾虾"
     author_url = "https://github.com/meeryang/MoviePilot-Plugins"
     plugin_config_prefix = "downloadmonitor_"
@@ -82,6 +87,14 @@ class DownloadMonitor(_PluginBase):
     # hash → 所属下载器 的短时缓存，用于纠正 MP 传错的 downloader
     _hash_owner: Dict[str, str] = {}
     _hash_owner_ts: float = 0.0
+    # 封面：配置开关 / 标题→海报URL缓存 / 待查队列 / 线程状态
+    _poster_on: bool = True
+    _poster_cache: Dict[str, str] = {}
+    _poster_pending: set = set()
+    _poster_lock = threading.Lock()
+    _poster_dirty: int = 0
+    _poster_started: bool = False
+    _poster_file: Optional[Path] = None
     # 仪表板短时缓存（类级，避免频繁打下载器）
     _cache: Optional[List[dict]] = None
     _cache_ts: float = 0.0
@@ -91,14 +104,21 @@ class DownloadMonitor(_PluginBase):
         self._enabled = False
         self._downloaders = []
         self._bridge_native = True
+        self._poster_on = True
         if config:
             self._enabled = bool(config.get("enabled"))
             self._bridge_native = bool(config.get("bridge_native", True))
+            self._poster_on = bool(config.get("poster_fill", True))
             raw_dl = config.get("downloaders")
             if isinstance(raw_dl, str):
                 raw_dl = [x.strip() for x in raw_dl.replace("，", ",").split(",")]
             self._downloaders = [str(n) for n in (raw_dl or []) if n]
         DownloadMonitor._inst = self
+        if self._enabled:
+            try:
+                self._poster_start()
+            except Exception as err:  # noqa: BLE001
+                logger.debug(f"【下载任务监控】启动封面线程失败：{err}")
         try:
             if self._enabled and self._bridge_native:
                 self._install_bridge()
@@ -106,6 +126,234 @@ class DownloadMonitor(_PluginBase):
                 self._uninstall_bridge()
         except Exception as err:  # noqa: BLE001
             logger.error(f"【{self.plugin_name}】桥接原生下载管理失败：{err}")
+
+    # ------------------------------------------------- 下载任务封面（TMDB）
+    # 字幕组/压制组、语言、格式等噪声词（命中即丢弃该分组）
+    _POSTER_NOISE = (
+        "nekomoe", "kissaten", "lolihouse", "kitaujisub", "anti-dei", "baha", "dynamis",
+        "orion origin", "mteam", "mteamhd", "jpsc", "webrip", "web-dl", "webdl", "bluray",
+        "blu-ray", "remux", "hevc", "avc", "aac", "flac", "dts", "truehd", "atmos", "10bit",
+        "8bit", "hdr", "dolby", "vision", "1080p", "2160p", "720p", "480p", "x264", "x265",
+        "cht", "chs", "简繁", "中字", "内封", "字幕", "国语", "粤语", "双语", "complete",
+        "fhd", "uhd", "hd", "sd", "xvid", "divx",
+        "repack", "proper", "internal", "multi",
+    )
+
+    @classmethod
+    def _poster_tokens(cls, title: Any) -> List[Tuple[str, bool]]:
+        """切成候选片段：(文本, 是否括号外)。括号外的通常是片名。"""
+        t = unicodedata.normalize("NFKC", str(title or ""))
+        t = re.sub(r"\.(mkv|mp4|avi|ts|m2ts|rmvb|iso|wmv|flv)$", " ", t, flags=re.I)
+        out: List[Tuple[str, bool]] = []
+        for grp in re.findall(r"[\[\{（(【]([^\]\}）)】]*)[\]\}）)】]", t):
+            out.append((grp, False))
+        outside = re.sub(r"[\[\{（(【][^\]\}）)】]*[\]\}）)】]", " ", t).strip()
+        if outside:
+            out.insert(0, (outside, True))
+        return out
+
+    @classmethod
+    def _poster_clean(cls, text: str) -> str:
+        """去掉噪声词、年份、集数、音轨/分辨率、发行组尾巴。"""
+        t = unicodedata.normalize("NFKC", str(text or ""))
+        t = re.sub(
+            r"\b(2160p|1080p|1080i|720p|480p|x264|x265|h ?264|h ?265|hevc|avc|remux|bluray|"
+            r"blu-?ray|web-?dl|webdl|webrip|hdtv|dts|dts-?hd|aac|ac3|eac3|ddp?|flac|truehd|"
+            r"10bit|8bit|hdr|dolby|vision|atmos|proper|repack|internal|complete|multi|chs|cht|"
+            r"ma|lpcm|opus|mkv|mp4)\b", " ", t, flags=re.I)
+        t = re.sub(r"(?i)\bS\d{1,2}(E\d{1,3})?\b", " ", t)          # S05 / S05E03
+        t = re.sub(r"(?i)\bE\d{1,3}\b", " ", t)
+        t = re.sub(r"\b\d\.\d\b", " ", t)                     # 5.1 / 7.1
+        t = re.split(r"\b(?:19|20)\d{2}\b", t)[0]               # 年份及之后
+        t = re.sub(r"(?i)(?:\s*[-–—]\s*|\bep\.?\s*|第\s*)(\d{1,4})(\s*(?:v\d|集|话|話))?\s*$",
+                   " ", t)                                        # 结尾集数
+        t = re.sub(r"\s*[-–—]\s*[A-Za-z0-9&]+$", " ", t)         # 结尾发行组
+        t = re.sub(r"[._\-]+", " ", t)
+        t = re.sub(r"\s{2,}", " ", t).strip(" -!·,")
+        return t[:80]
+
+    @classmethod
+    def _poster_key(cls, title: Any) -> str:
+        """主检索键：优先括号外文本，其次最长的有效括号组。"""
+        best: Tuple[int, str] = (0, "")
+        for text, outside in cls._poster_tokens(title):
+            cleaned = cls._poster_clean(text)
+            if not cleaned or re.fullmatch(r"[\d\s.]+", cleaned):
+                continue
+            low = cleaned.lower()
+            if any(n in low for n in cls._POSTER_NOISE):
+                continue
+            score = (1000 if outside else 0) + len(cleaned)
+            if score > best[0]:
+                best = (score, cleaned)
+        return best[1] or cls._poster_clean(str(title or ""))
+
+    @staticmethod
+    def _poster_similar(a: str, b: str) -> float:
+        """粗略相似度，用于降低 TMDB 错配。"""
+        import difflib
+        na = re.sub(r"[^0-9a-z\u4e00-\u9fff]", "", str(a or "").lower())
+        nb = re.sub(r"[^0-9a-z\u4e00-\u9fff]", "", str(b or "").lower())
+        if not na or not nb:
+            return 0.0
+        if na in nb or nb in na:
+            return 1.0
+        return difflib.SequenceMatcher(None, na, nb).ratio()
+
+    @classmethod
+    def _poster_lookup(cls, title: str) -> str:
+        """多候选查 TMDB 海报；结果少时信任 TMDB 排序，多时用相似度筛。"""
+        key = str(title or "").strip()
+        if not key:
+            return ""
+        # 纯 hash / 纯数字结尾的任务名没有检索价值
+        if re.fullmatch(r"[0-9a-fA-F]{16,}", key) or len(key) < 2:
+            return ""
+        candidates = [key]
+        short = re.sub(r"\s+\d{1,4}$", "", key).strip()
+        if short and short != key:
+            candidates.append(short)
+        words = short.split()
+        if len(words) > 4:
+            candidates.append(" ".join(words[:4]))
+        try:
+            from app.modules.themoviedb.tmdbapi import TmdbApi
+            api = TmdbApi()
+        except Exception as err:  # noqa: BLE001
+            logger.debug(f"【下载任务监控】TMDB 不可用：{err}")
+            return ""
+        for cand in candidates:
+            try:
+                recs = api.search_multiis(cand) or []
+            except Exception as err:  # noqa: BLE001
+                logger.debug(f"【下载任务监控】TMDB 检索失败 {cand!r}：{err}")
+                continue
+            top = [r for r in recs if isinstance(r, dict) and r.get("poster_path")][:4]
+            if not top:
+                continue
+            best_score, best_rec = 0.0, top[0]
+            for rec in top:
+                names = [rec.get("title"), rec.get("name"),
+                         rec.get("original_title"), rec.get("original_name")]
+                score = max((cls._poster_similar(cand, n) for n in names if n), default=0.0)
+                if score > best_score:
+                    best_score, best_rec = score, rec
+            # 中日文片名与罗马音/英文标题相似度天然为 0，此时信任 TMDB 的相关度排序
+            chosen = best_rec if best_score >= 0.45 else top[0]
+            path = chosen.get("poster_path")
+            if path:
+                return f"https://image.tmdb.org/t/p/w500{path}"
+        return ""
+
+    def _poster_load(self) -> None:
+        """从插件数据目录读取缓存。"""
+        try:
+            path = Path(self.get_data_path()) / "posters.json"
+            DownloadMonitor._poster_file = path
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    DownloadMonitor._poster_cache = {str(k): str(v) for k, v in data.items()}
+                    logger.info(f"【{self.plugin_name}】封面缓存载入 {len(data)} 条")
+        except Exception as err:  # noqa: BLE001
+            logger.debug(f"【下载任务监控】读取封面缓存失败：{err}")
+
+    def _poster_save(self) -> None:
+        """把缓存落盘（失败不影响功能）。"""
+        path = DownloadMonitor._poster_file
+        if not path:
+            return
+        try:
+            with DownloadMonitor._poster_lock:
+                data = dict(DownloadMonitor._poster_cache)
+                DownloadMonitor._poster_dirty = 0
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        except Exception as err:  # noqa: BLE001
+            logger.debug(f"【下载任务监控】写封面缓存失败：{err}")
+
+    def _poster_worker(self) -> None:
+        """后台限速补全封面，避免拖慢列表请求。"""
+        while True:
+            try:
+                inst = DownloadMonitor._inst
+                if not inst or not getattr(inst, "_enabled", False) \
+                        or not getattr(inst, "_poster_on", False):
+                    time.sleep(3.0)
+                    continue
+                with DownloadMonitor._poster_lock:
+                    key = DownloadMonitor._poster_pending.pop() if DownloadMonitor._poster_pending else None
+                if not key:
+                    time.sleep(2.0)
+                    continue
+                if key in DownloadMonitor._poster_cache:
+                    continue
+                url = self._poster_lookup(key)
+                with DownloadMonitor._poster_lock:
+                    DownloadMonitor._poster_cache[key] = url
+                    DownloadMonitor._poster_dirty += 1
+                if DownloadMonitor._poster_dirty >= 20:
+                    self._poster_save()
+                time.sleep(0.5)
+            except Exception as err:  # noqa: BLE001
+                logger.debug(f"【下载任务监控】封面线程异常：{err}")
+                time.sleep(2.0)
+
+    def _poster_start(self) -> None:
+        """启动封面后台线程（幂等）。"""
+        if DownloadMonitor._poster_started or not DownloadMonitor._poster_on:
+            return
+        if not DownloadMonitor._poster_file:
+            self._poster_load()
+        DownloadMonitor._poster_started = True
+        threading.Thread(target=self._poster_worker, name="dm-poster", daemon=True).start()
+        logger.info(f"【{self.plugin_name}】封面补全线程已启动")
+
+    def _apply_posters(self, rows: List[Any]) -> List[Any]:
+        """把已知封面写进 task.media.poster，未知标题丢给后台线程。"""
+        if not DownloadMonitor._poster_on or not rows:
+            return rows
+        try:
+            from app.schemas.transfer import DownloadTaskMedia
+        except Exception:
+            return rows
+        cache = DownloadMonitor._poster_cache
+        queued = 0
+        for row in rows:
+            media = getattr(row, "media", None)
+            if media is not None and getattr(media, "poster", None):
+                continue
+            key = self._poster_key(getattr(row, "title", None) or getattr(row, "name", None))
+            if not key:
+                continue
+            url = cache.get(key)
+            if url is None:
+                with DownloadMonitor._poster_lock:
+                    if key not in DownloadMonitor._poster_pending:
+                        DownloadMonitor._poster_pending.add(key)
+                        queued += 1
+                continue
+            if not url:
+                continue
+            try:
+                if media is not None:
+                    media.poster = url
+                else:
+                    row.media = DownloadTaskMedia(poster=url)
+            except Exception:
+                try:
+                    row.media = DownloadTaskMedia(poster=url)
+                except Exception:
+                    continue
+        if queued:
+            logger.debug(f"【下载任务监控】新增 {queued} 个待查封面标题")
+        return rows
+
+    def _poster_stats(self) -> Dict[str, int]:
+        cache = DownloadMonitor._poster_cache
+        return {"cached": len(cache), "hit": sum(1 for v in cache.values() if v),
+                "miss": sum(1 for v in cache.values() if not v),
+                "pending": len(DownloadMonitor._poster_pending)}
 
     # ------------------------------------------------- 原生「下载管理」桥接
     @staticmethod
@@ -237,7 +485,7 @@ class DownloadMonitor(_PluginBase):
             rows = _fetch(chain_self, name or None)
             if not rows:
                 return prev_downloading(chain_self, name, **kwargs)
-            return _annotate(chain_self, rows)
+            return (DownloadMonitor._inst or plugin)._apply_posters(_annotate(chain_self, rows))
 
         def _owner_of(chain_self: Any, hash_str: Optional[str]) -> Optional[str]:
             """查某个 hash 真正属于哪个下载器。
@@ -432,6 +680,7 @@ class DownloadMonitor(_PluginBase):
                 col(4, switch("enabled", "启用插件")),
                 col(4, switch("bridge_native", "桥接原生下载管理")),
                 col(4, field("downloaders", "统计的下载器(逗号分隔)", "留空=全部")),
+                col(4, switch("poster_fill", "自动补封面（TMDB）")),
             ]},
             {"component": "VRow", "content": [
                 col(12, {"component": "VAlert",
@@ -441,7 +690,7 @@ class DownloadMonitor(_PluginBase):
                                            "改标签 / 限速；关闭则恢复 MP 原生行为。"}}),
             ]},
         ]
-        defaults = {"enabled": False, "bridge_native": True, "downloaders": ""}
+        defaults = {"enabled": False, "bridge_native": True, "downloaders": "", "poster_fill": True}
         return [{"component": "VForm", "content": rows}], defaults
 
     # ------------------------------------------------------------------ 插件页
@@ -538,7 +787,34 @@ class DownloadMonitor(_PluginBase):
             {"path": "/rescan", "endpoint": self.api_rescan, "methods": ["POST"],
              "summary": "重建任务归属缓存",
              "description": "清空 hash → 下载器 的映射缓存，下次操作时自动重建"},
+            {"path": "/posters", "endpoint": self.api_posters, "methods": ["GET"],
+             "summary": "封面缓存统计"},
+            {"path": "/fill_posters", "endpoint": self.api_fill_posters, "methods": ["POST"],
+             "summary": "补全全部任务封面",
+             "description": "把当前全部任务的标题入队，由后台线程限速查询 TMDB 海报"},
         ]
+
+    def api_posters(self) -> dict:
+        """封面缓存统计。"""
+        stats = self._poster_stats()
+        stats.update({"success": True, "enabled": bool(DownloadMonitor._poster_on),
+                      "running": bool(DownloadMonitor._poster_started)})
+        return stats
+
+    def api_fill_posters(self) -> dict:
+        """把当前全部任务标题入队，交给后台线程补封面。"""
+        rows = self._cached_rows()
+        added = 0
+        with DownloadMonitor._poster_lock:
+            for row in rows:
+                key = self._poster_key(row.get("title") or row.get("name"))
+                if key and key not in DownloadMonitor._poster_cache:
+                    if key not in DownloadMonitor._poster_pending:
+                        DownloadMonitor._poster_pending.add(key)
+                        added += 1
+        self._poster_start()
+        return {"success": True, "queued": added, "pending": len(DownloadMonitor._poster_pending),
+                "message": f"已入队 {added} 个待查标题，后台会限速补全"}
 
     def api_rescan(self) -> dict:
         """清空 hash→下载器 归属缓存与任务缓存。"""
