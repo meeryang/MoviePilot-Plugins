@@ -71,7 +71,7 @@ class LxMusicDownloader(_PluginBase):
     plugin_name = "LX音乐下载"
     plugin_desc = "音乐专辑订阅联动：订阅-音乐新增专辑时按网易云/QQ 搜索整张专辑并经 LX音乐下载；支持音质选择"
     plugin_icon = "https://gitee.com/makimayang/obsidian/raw/main/icon.png"
-    plugin_version = "3.7"
+    plugin_version = "3.8"
     plugin_author = "虾虾"
     author_url = ""
     plugin_config_prefix = "lxmusicdownloader_"
@@ -188,6 +188,13 @@ class LxMusicDownloader(_PluginBase):
                 "methods": ["GET"],
                 "summary": "专辑搜索测试",
                 "description": "按专辑名依次调用网易云/QQ 搜索专辑并列出曲目",
+            },
+            {
+                "path": "/sync_progress",
+                "endpoint": self.api_sync_progress,
+                "methods": ["GET", "POST"],
+                "summary": "写回订阅进度",
+                "description": "按音乐库实际曲目数更新 MP「订阅-音乐」的 N/M 显示",
             },
             {
                 "path": "/artist_album_test",
@@ -690,6 +697,14 @@ class LxMusicDownloader(_PluginBase):
                         logger.info(f"【{self.plugin_name}】专辑补全：{_fmsg}")
             except Exception as e:
                 logger.error(f"【{self.plugin_name}】专辑补全异常：{e}")
+            # 把音乐库实际曲目数写回 MP 订阅，让「订阅-音乐」显示 N/M 而不是恒 0/M
+            try:
+                if inst._enabled and inst._music_sub:
+                    _pn, _pmsg = inst.sync_subscribe_progress()
+                    if _pn:
+                        logger.info(f"【{self.plugin_name}】订阅进度写回：{_pmsg}")
+            except Exception as e:
+                logger.error(f"【{self.plugin_name}】订阅进度写回异常：{e}")
             # 关键词订阅较重，每 24 轮一次
             try:
                 if inst._enabled and inst._subscribes.strip() and keyword_tick % 24 == 0:
@@ -2149,12 +2164,76 @@ class LxMusicDownloader(_PluginBase):
             if not nm:
                 continue
             out.append({
+                "id": getattr(s, "id", None),
                 "name": nm,
                 "total_tracks": getattr(s, "total_tracks", None),
                 "media_source": getattr(s, "media_source", None),
                 "media_id": getattr(s, "media_id", None),
             })
         return out
+
+    def sync_subscribe_progress(self) -> Tuple[int, str]:
+        """把已落地到音乐库的曲目写回 MP 订阅的 downloaded_tracks，让「订阅-音乐」显示 N/M。
+
+        背景：MoviePilot 只在**自己的下载链**（种子文件清单 → 解析盘号/曲序）时才会累计
+        `subscribe.downloaded_tracks`；前端 `schemas/subscribe.py` 用
+        `len(set(downloaded_tracks))` 当分子、`total_tracks` 当分母。
+        本插件是把歌直接提交给 lxserver 队列再搬进音乐库，MP 完全看不见，
+        所以订阅进度恒为 0/M。这里按音乐库实际文件补写该字段。
+
+        键格式与 MP 一致：JSON 字符串 `[盘号, 曲序或归一化曲名]`，只要求唯一且稳定。
+        """
+        try:
+            from app.db.oper.subscribe import SubscribeOper
+        except Exception as e:
+            return 0, f"无法导入 SubscribeOper：{e}"
+        subs = self._subscribed_albums()
+        if not subs:
+            return 0, "没有音乐专辑订阅"
+        try:
+            lib = self.cache_list("music")
+        except Exception as e:
+            return 0, f"读取音乐库失败：{e}"
+        by_album: dict = {}
+        for it in lib:
+            k = self._album_key(it.get("album") or "")
+            n = self._norm(it.get("name") or "")
+            if not k or not n:
+                continue
+            by_album.setdefault(k, set()).add(n)
+        if not by_album:
+            return 0, "音乐库为空（未匹配到带专辑信息的文件）"
+        try:
+            op = SubscribeOper()
+        except Exception as e:
+            return 0, f"初始化 SubscribeOper 失败：{e}"
+        changed, details = 0, []
+        for a in subs:
+            sid = a.get("id")
+            if not sid:
+                continue
+            names = by_album.get(self._album_key(a["name"]))
+            if not names:
+                continue
+            total = a.get("total_tracks")
+            picked = sorted(names)
+            if total and len(picked) > int(total):
+                picked = picked[:int(total)]
+            keys = [json.dumps([1, n.upper()], ensure_ascii=False, separators=(",", ":"))
+                    for n in picked]
+            try:
+                cur = op.get(int(sid))
+                cur_keys = sorted(x for x in (getattr(cur, "downloaded_tracks", None) or [])
+                                  if isinstance(x, str)) if cur else []
+                if cur_keys == sorted(keys):
+                    continue
+                op.update(int(sid), {"downloaded_tracks": keys})
+                changed += 1
+                details.append(f"{a['name']} {len(keys)}/{total or '?'}")
+            except Exception as e:
+                logger.warning(f"【{self.plugin_name}】写回订阅 {sid} 进度失败：{e}")
+        msg = "；".join(details) if details else "订阅进度已是最新"
+        return changed, msg
 
     def check_subscribed_albums(self, max_fill: int = 40) -> Tuple[int, str]:
         """核对「已订阅音乐专辑」的曲目数，把缺的补下来。
@@ -2367,6 +2446,15 @@ class LxMusicDownloader(_PluginBase):
         except Exception as e:
             logger.error(f"【{self.plugin_name}】手动轮询异常：{e}")
             return {"success": False, "message": f"运行失败：{e}"}
+
+    def api_sync_progress(self):
+        """手动把音乐库实际曲目写回 MP 订阅进度（让订阅-音乐显示 N/M）"""
+        try:
+            n, msg = self.sync_subscribe_progress()
+            return {"success": True, "message": f"已更新 {n} 个订阅：{msg}"}
+        except Exception as e:
+            logger.error(f"【{self.plugin_name}】手动写回订阅进度异常：{e}")
+            return {"success": False, "message": f"失败：{e}"}
 
     def api_artist_album_test(self, artist: str = "", album: str = "", expect: int = 0):
         """歌手优先流程测试端点：完整走一遍链路并返回每一步的结果。"""
