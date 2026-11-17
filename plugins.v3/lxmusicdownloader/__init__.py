@@ -71,7 +71,7 @@ class LxMusicDownloader(_PluginBase):
     plugin_name = "LX音乐下载"
     plugin_desc = "音乐专辑订阅联动：订阅-音乐新增专辑时按网易云/QQ 搜索整张专辑并经 LX音乐下载；支持音质选择"
     plugin_icon = "https://gitee.com/makimayang/obsidian/raw/main/icon.png"
-    plugin_version = "3.8"
+    plugin_version = "3.9"
     plugin_author = "虾虾"
     author_url = ""
     plugin_config_prefix = "lxmusicdownloader_"
@@ -371,7 +371,101 @@ class LxMusicDownloader(_PluginBase):
         }
 
     def get_page(self) -> List[dict]:
-        """插件详情页：提供「运行一次」立即触发轮询"""
+        """插件详情页：卡片式布局（统计概览 + 动作区 + 最近处理 + 流程说明）。
+        风格对齐内置「自动订阅助手」：顶部统计卡片行、按钮组、底部流程说明。
+        注意：v3 的侧栏入口（get_sidebar_nav）只聚合 render_mode="vue" 的插件，
+        本插件是 Vuetify JSON 渲染，因此入口仍在「插件」列表里。
+        """
+        def _btn(text, icon, color, path, variant="flat"):
+            js = ("function(e) {"
+                  "  window.MoviePilotAPI.post('plugin/LxMusicDownloader/" + path + "', {})"
+                  "    .then(function(r) {"
+                  "      if (!r || r.success === false) { alert((r && r.message) || '失败，请查看日志'); return; }"
+                  "      alert(r.message || '完成');"
+                  "    })"
+                  "    .catch(function(err) { console.error(err); alert('失败，请查看日志'); });"
+                  "}")
+            return {"component": "VBtn",
+                    "props": {"color": color, "variant": variant, "block": True,
+                              "prepend-icon": icon, "onclick": js},
+                    "text": text}
+
+        def _stat(title, value, icon, color="primary"):
+            return {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [
+                {"component": "VCard", "props": {"variant": "tonal", "color": color}, "content": [
+                    {"component": "VCardText", "props": {"class": "d-flex align-center"}, "content": [
+                        {"component": "VIcon",
+                         "props": {"icon": icon, "size": 32, "class": "me-3"}},
+                        {"component": "div", "content": [
+                            {"component": "div",
+                             "props": {"class": "text-caption text-medium-emphasis"}, "text": title},
+                            {"component": "div",
+                             "props": {"class": "text-h6 font-weight-bold"}, "text": str(value)},
+                        ]},
+                    ]},
+                ]},
+            ]}
+
+        try:
+            state = self.get_data("music_subs") or {}
+        except Exception:
+            state = {}
+        processed = state.get("processed") or {}
+        total_sub = len(state.get("baseline") or []) or len(processed)
+
+        rows = [{"component": "VRow", "content": [
+            _stat("音乐专辑订阅", total_sub, "mdi-music-box-multiple", "primary"),
+            _stat("已处理", len(processed), "mdi-check-circle-outline", "success"),
+            _stat("下载音质", self._quality, "mdi-waveform", "info"),
+            _stat("轮询间隔", f"{getattr(self, '_interval', 30)} 分钟", "mdi-timer-outline", "secondary"),
+        ]}, {"component": "VRow", "content": [
+            {"component": "VCol", "props": {"cols": 12, "md": 3},
+             "content": [_btn("运行一次", "mdi-play-circle-outline", "primary", "run_once")]},
+            {"component": "VCol", "props": {"cols": 12, "md": 3},
+             "content": [_btn("写回订阅进度", "mdi-progress-sync", "success", "sync_progress", "tonal")]},
+            {"component": "VCol", "props": {"cols": 12, "md": 3},
+             "content": [_btn("缓存入库", "mdi-folder-move", "info", "promote", "tonal")]},
+            {"component": "VCol", "props": {"cols": 12, "md": 3},
+             "content": [_btn("清理缓存", "mdi-broom", "warning", "clear_open", "tonal")]},
+        ]}]
+
+        recent = list(processed.items())[-8:]
+        if recent:
+            lines = []
+            for sid, rec in recent:
+                rec = rec or {}
+                nm = rec.get("name") or f"订阅 #{sid}"
+                cnt = rec.get("count") or rec.get("tracks") or ""
+                lines.append({"component": "div",
+                              "props": {"class": "text-body-2 py-1"},
+                              "text": f"· {nm}" + (f" · {cnt} 首" if cnt else "")})
+            rows.append({"component": "VRow", "content": [
+                {"component": "VCol", "props": {"cols": 12}, "content": [
+                    {"component": "VCard", "props": {"variant": "outlined"}, "content": [
+                        {"component": "VCardText", "content": [
+                            {"component": "div",
+                             "props": {"class": "text-subtitle-2 font-weight-bold mb-1"},
+                             "text": "最近处理的专辑"},
+                        ] + lines},
+                    ]},
+                ]},
+            ]})
+
+        rows.append({"component": "VRow", "content": [
+            {"component": "VCol", "props": {"cols": 12}, "content": [
+                {"component": "VAlert",
+                 "props": {"type": "info", "variant": "tonal", "title": "下载流程",
+                           "text": ("核对订阅专辑（歌手+专辑名）→ 搜索歌手 → 核对演唱者 → "
+                                    "进歌手全部专辑 → 查找并核对专辑 → 提交 lxserver 队列 → "
+                                    "搬进 /server/music → 清理小文件与 cache/_open。"
+                                    f"搜索顺序 {self._album_order}；入库账号 {self._lx_user}；"
+                                    f"服务端 {self._server_url}。")}},
+            ]},
+        ]})
+        return rows
+
+    def _legacy_page(self) -> List[dict]:
+        """旧版单按钮页面（保留备用，不再对外使用）"""
         onclick = (
             "function(e) {"
             "  window.MoviePilotAPI.post('plugin/LxMusicDownloader/run_once', {})"
