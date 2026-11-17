@@ -89,7 +89,7 @@ class DownloadMonitor(_PluginBase):
     plugin_desc = "实时监控 qBittorrent / Transmission 全部任务，支持多字段排序"
     plugin_icon = ""
     plugin_color = "#1976D2"
-    plugin_version = "2.1.0"
+    plugin_version = "2.2.0"
     plugin_author = "虾虾"
     author_url = "https://github.com/meeryang/MoviePilot-Plugins"
     plugin_config_prefix = "downloadmonitor_"
@@ -233,15 +233,19 @@ class DownloadMonitor(_PluginBase):
                     continue
             return rows
 
-        def patched_downloading(chain_self: Any, name: Any = None, **kwargs: Any) -> Any:
-            if name or not _enabled():
-                return prev_downloading(chain_self, name, **kwargs)
+        def _fetch(chain_self: Any, only: Optional[str]) -> List[Any]:
+            """取任务列表：`only` 为空时合并全部下载器，否则只取该下载器。
+
+            两种情况都用「全部状态 + 全部标签」，否则会漏掉做种完成与外部添加的任务。
+            逐个模块调用而不是走 `chain_self.list_torrents`：`run_module` 只采用第一个
+            返回非空结果的模块，指定 `downloader` 时可能被别的模块提前截断。
+            """
             rows: List[Any] = []
             seen = set()
             for mod in DownloadMonitor._downloader_modules("list_torrents"):
                 got = None
                 try:
-                    got = mod.list_torrents(status=None, hashs=None, downloader=None,
+                    got = mod.list_torrents(status=None, hashs=None, downloader=only,
                                             include_all_tags=True)
                 except TypeError:
                     try:
@@ -257,6 +261,12 @@ class DownloadMonitor(_PluginBase):
                         continue
                     seen.add(key)
                     rows.append(row)
+            return rows
+
+        def patched_downloading(chain_self: Any, name: Any = None, **kwargs: Any) -> Any:
+            if not _enabled():
+                return prev_downloading(chain_self, name, **kwargs)
+            rows = _fetch(chain_self, name or None)
             if not rows:
                 return prev_downloading(chain_self, name, **kwargs)
             return _annotate(chain_self, rows)
