@@ -72,7 +72,7 @@ class LxMusicDownloader(_PluginBase):
     plugin_name = "LX音乐下载"
     plugin_desc = "音乐专辑订阅联动：订阅-音乐新增专辑时按网易云/QQ 搜索整张专辑并经 LX音乐下载；支持音质选择"
     plugin_icon = "https://gitee.com/makimayang/obsidian/raw/main/icon.png"
-    plugin_version = "4.2.2"
+    plugin_version = "4.3.3"
     plugin_author = "虾虾"
     author_url = ""
     plugin_config_prefix = "lxmusicdownloader_"
@@ -85,6 +85,9 @@ class LxMusicDownloader(_PluginBase):
     _token: str = ""
     _quality: str = "320k"
     _subscribes: str = ""
+    # 本地音乐库 名称→歌手 索引缓存
+    _lib_idx: dict = {}
+    _lib_ts: float = 0.0
     # MP 音乐订阅快照缓存
     _mp_subs_cache: dict = {}
     _mp_subs_ts: float = 0.0
@@ -445,62 +448,140 @@ class LxMusicDownloader(_PluginBase):
                     return row
         return {}
 
-    def _lx_cover(self, name: str, keyword: str = "", msg: str = "") -> dict:
-        """回退：MP 无此专辑时用 lxserver 搜索，要求专辑名匹配，宁可无封面也不张冠李戴。"""
+    _AUDIO_EXT = (".mp3", ".flac", ".m4a", ".wav", ".ogg", ".ape", ".aac")
+
+    def _lib_artist_index(self) -> dict:
+        """扫描音乐库文件名（专辑 - 歌手 - 音质 - 歌名.ext）建立 专辑/歌名 → 歌手 索引。"""
+        now = time.time()
+        if LxMusicDownloader._lib_idx and now - LxMusicDownloader._lib_ts < 600:
+            return LxMusicDownloader._lib_idx
+        idx: dict = {}
+        base = (self._local_music_dir or "").rstrip("/") or "/media/downloads/music"
+        for folder in ("music", "cache"):
+            root = os.path.join(base, folder)
+            if not os.path.isdir(root):
+                continue
+            for cur, _dirs, files in os.walk(root):
+                for fn in files:
+                    if not fn.lower().endswith(self._AUDIO_EXT):
+                        continue
+                    stem = os.path.splitext(fn)[0]
+                    parts = [p.strip() for p in stem.split(" - ") if p.strip()]
+                    if len(parts) < 2:
+                        continue
+                    album, artist = parts[0], parts[1]
+                    for key in {self._norm(album), self._norm(parts[-1])}:
+                        if key:
+                            idx.setdefault(key, artist)
+        LxMusicDownloader._lib_idx = idx
+        LxMusicDownloader._lib_ts = now
+        logger.debug(f"【{self.plugin_name}】音乐库歌手索引 {len(idx)} 条")
+        return idx
+
+    def _lib_artist(self, name: str) -> str:
+        """按专辑名/歌名在本地音乐库反查歌手，作为封面双项核对的独立线索。"""
+        target = self._norm(name)
+        if not target:
+            return ""
+        idx = self._lib_artist_index()
+        if target in idx:
+            return idx[target]
+        for key, artist in idx.items():
+            if key and (target in key or key in target):
+                return artist
+        return ""
+
+    def _lx_search(self, keyword: str) -> list:
+        """调 lxserver 搜索，返回歌曲列表。"""
+        try:
+            r = requests.get(f"{self._server_url}/api/music/search",
+                             params={"name": keyword, "token": self._token},
+                             headers=self._headers(), timeout=15)
+            data = r.json() if r.status_code == 200 else None
+            rows = (data.get("list") if isinstance(data, dict) else data) or []
+            return rows if isinstance(rows, list) else []
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"【{self.plugin_name}】lxserver 搜索失败「{keyword}」：{e}")
+            return []
+
+    def _lx_pick(self, name: str, keyword: str, msg: str, artist_hint: str) -> dict:
+        """LX 优先取封面：专辑名 + 歌手名 两项都必须对上才采用。"""
+        hint = self._norm(artist_hint)
         for cand in (self._quoted_album(msg), name, keyword):
             target = self._norm(cand)
             if not target:
                 continue
-            try:
-                r = requests.get(f"{self._server_url}/api/music/search",
-                                 params={"name": cand, "token": self._token},
-                                 headers=self._headers(), timeout=15)
-                data = r.json() if r.status_code == 200 else None
-                rows = (data.get("list") if isinstance(data, dict) else data) or []
-            except Exception as e:  # noqa: BLE001
-                logger.debug(f"【{self.plugin_name}】lxserver 取封面失败「{cand}」：{e}")
+            exact = [s for s in self._lx_search(cand)
+                     if self._norm(s.get("albumName")) == target]
+            if not exact:
                 continue
-            if not isinstance(rows, list):
-                continue
-            for song in rows:
-                album_key = self._norm(song.get("albumName"))
-                if album_key and album_key == target:
-                    cover = (song.get("img") or "").replace("http://", "https://")
-                    if cover and "?" not in cover:
-                        cover += "?param=300y300"
-                    return {"cover": cover, "artist": song.get("singer") or ""}
+            if hint:
+                ok = [s for s in exact
+                      if hint in self._norm(s.get("singer"))
+                      or self._norm(s.get("singer")) in hint]
+                if not ok:
+                    # 艺名不同（如库里记「王灏儿」、LX 记「JW」）：拿歌手名反查 LX，
+                    # 若搜这个歌手能命中同一张专辑，则认定为同一人的不同艺名
+                    alias = [s for s in self._lx_search(artist_hint)
+                             if self._norm(s.get("albumName")) == target]
+                    if alias:
+                        ok = alias
+                        logger.debug(f"【{self.plugin_name}】封面艺名解析通过："
+                                     f"专辑「{cand}」{artist_hint} ↔ {alias[0].get('singer')}")
+                    else:
+                        logger.debug(f"【{self.plugin_name}】封面核对未过：专辑「{cand}」"
+                                     f"歌手需 {artist_hint}，LX 候选 "
+                                     f"{[s.get('singer') for s in exact][:3]}")
+                        continue
+                pick = ok[0]
+            else:
+                # 没有歌手线索时，只有全候选歌手一致才敢采用
+                singers = {self._norm(s.get("singer")) for s in exact}
+                if len(singers) != 1:
+                    logger.debug(f"【{self.plugin_name}】封面核对未过：专辑「{cand}」缺歌手线索且候选歌手不一致")
+                    continue
+                pick = exact[0]
+            cover = (pick.get("img") or "").replace("http://", "https://")
+            if cover and "?" not in cover:
+                cover += "?param=300y300"
+            return {"cover": cover,
+                    "artist": pick.get("singer") or "",
+                    "album": pick.get("albumName") or cand,
+                    "verified": True}
         return {}
 
     def _album_meta_build(self, name: str, keyword: str, organize_at: str,
-                          msg: str = "") -> dict:
+                          msg: str = "", artist_hint: str = "") -> dict:
         """单张专辑的展示信息：优先 MP（封面/歌手/推出日期/添加日期），缺口回退 lxserver。"""
+        # MP 侧先查一遍：既提供兜底封面，也用来给出歌手线索做双项核对
         sub = self._mp_sub_for(name, keyword, msg)
-        meta = {
-            "name": sub.get("name") or name,
-            "artist": "",
-            "release": str(sub.get("year") or ""),
-            "added": (sub.get("date") or "")[:10],
-            "organize": (organize_at or "")[:10],
-            "cover": sub.get("poster") or "",
-            "source": "mp" if sub else "",
-        }
+        mp_artist, mp_release, mp_cover = "", str(sub.get("year") or ""), sub.get("poster") or ""
         media_id, media_source = sub.get("media_id"), sub.get("media_source")
         if media_id and media_source:
             detail = self._mp_api(f"/music/album/{media_id}", media_source=media_source) or {}
             if isinstance(detail, dict) and detail:
                 artists = detail.get("artists") or []
-                meta["artist"] = detail.get("artist") or (artists[0] if artists else "")
-                meta["release"] = (detail.get("release_date")
-                                   or str(detail.get("original_year") or "") or meta["release"])
-                meta["cover"] = meta["cover"] or detail.get("cover_url") \
-                    or detail.get("poster_path") or ""
-        if not meta["cover"] or not meta["artist"]:
-            fb = self._lx_cover(name, keyword, msg)
-            meta["cover"] = meta["cover"] or fb.get("cover") or ""
-            meta["artist"] = meta["artist"] or fb.get("artist") or ""
-            if fb and not meta["source"]:
-                meta["source"] = "lx"
-        return meta
+                mp_artist = detail.get("artist") or (artists[0] if artists else "")
+                mp_release = (detail.get("release_date")
+                              or str(detail.get("original_year") or "") or mp_release)
+                mp_cover = mp_cover or detail.get("cover_url") or detail.get("poster_path") or ""
+
+        # 歌手线索：处理记录 → 本地音乐库目录 → MP 专辑详情
+        hint = artist_hint or self._lib_artist(name) or self._lib_artist(self._quoted_album(msg)) \
+            or mp_artist
+        # LX 优先：专辑名 + 歌手名双项核对通过才采用
+        lx = self._lx_pick(name, keyword, msg, hint)
+
+        return {
+            "name": lx.get("album") or sub.get("name") or name,
+            "artist": lx.get("artist") or mp_artist or "",
+            "release": mp_release,
+            "added": (sub.get("date") or "")[:10],
+            "organize": (organize_at or "")[:10],
+            "cover": lx.get("cover") or mp_cover,
+            "source": "lx" if lx else ("mp" if sub else ""),
+            "verified": bool(lx.get("verified")),
+        }
 
     def _album_meta_fill(self, recs) -> None:
         """后台补齐缺失的专辑元数据，不阻塞页面渲染。"""
@@ -509,15 +590,15 @@ class LxMusicDownloader(_PluginBase):
         for rec in recs:
             nm = rec.get("name") or ""
             if nm and not cache.get(self._norm(nm)):
-                todo.append((nm, rec.get("keyword") or nm,
-                             rec.get("at") or "", rec.get("msg") or ""))
+                todo.append((nm, rec.get("keyword") or nm, rec.get("at") or "",
+                             rec.get("msg") or "", rec.get("artist") or ""))
         if not todo:
             return
 
         def _run():
-            for nm, kw, at, msg in todo[:12]:
+            for nm, kw, at, msg, art in todo[:14]:
                 try:
-                    meta = self._album_meta_build(nm, kw, at, msg)
+                    meta = self._album_meta_build(nm, kw, at, msg, art)
                     cache[self._norm(nm)] = meta
                     self._album_meta_save(cache)
                 except Exception:  # noqa: BLE001
@@ -586,7 +667,7 @@ class LxMusicDownloader(_PluginBase):
         ]}]
 
         recs = sorted((rec or {} for rec in processed.values()),
-                      key=lambda r: r.get("at") or "", reverse=True)[:9]
+                      key=lambda r: r.get("at") or "", reverse=True)[:12]
         if recs:
             metas = self._album_meta_map()
             self._album_meta_fill(recs)
@@ -629,7 +710,7 @@ class LxMusicDownloader(_PluginBase):
                             "props": {"class": "text-caption text-medium-emphasis text-truncate"},
                             "text": f"{label}：{value}"}
 
-                cards.append({"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                cards.append({"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [
                     {"component": "VCard", "props": {"variant": "outlined", "height": "100%"},
                      "content": [
                          {"component": "div",
@@ -645,8 +726,8 @@ class LxMusicDownloader(_PluginBase):
                              line("整理", organize),
                          ]},
                      ]}]})
-            for i in range(0, len(cards), 3):
-                rows.append({"component": "VRow", "content": cards[i:i + 3]})
+            for i in range(0, len(cards), 4):
+                rows.append({"component": "VRow", "content": cards[i:i + 4]})
 
         rows.append({"component": "VRow", "content": [
             {"component": "VCol", "props": {"cols": 12}, "content": [
@@ -2413,6 +2494,7 @@ class LxMusicDownloader(_PluginBase):
             try:
                 self._album_meta_fill([{"name": a.get("name") or "",
                                         "keyword": _kw or a.get("name") or "",
+                                        "artist": artist or "",
                                         "at": time.strftime("%Y-%m-%d %H:%M:%S")}])
             except Exception:  # noqa: BLE001
                 pass
