@@ -23,6 +23,7 @@ import time
 import json
 import re
 import unicodedata
+import threading
 import requests
 from typing import List, Optional, Tuple
 
@@ -71,7 +72,7 @@ class LxMusicDownloader(_PluginBase):
     plugin_name = "LX音乐下载"
     plugin_desc = "音乐专辑订阅联动：订阅-音乐新增专辑时按网易云/QQ 搜索整张专辑并经 LX音乐下载；支持音质选择"
     plugin_icon = "https://gitee.com/makimayang/obsidian/raw/main/icon.png"
-    plugin_version = "3.9"
+    plugin_version = "4.1.1"
     plugin_author = "虾虾"
     author_url = ""
     plugin_config_prefix = "lxmusicdownloader_"
@@ -84,7 +85,8 @@ class LxMusicDownloader(_PluginBase):
     _token: str = ""
     _quality: str = "320k"
     _subscribes: str = ""
-    _limit: int = 10
+    # 每个订阅最多下载的歌曲数（固定值，原配置项已移除）
+    _PER_SUB_LIMIT: int = 10
     _notify: bool = True
     _only_new: bool = True
 
@@ -107,11 +109,8 @@ class LxMusicDownloader(_PluginBase):
         self._token = config.get("token") or ""
         self._quality = config.get("quality") or "320k"
         self._subscribes = config.get("subscribes") or ""
-        self._limit = int(config.get("limit") or 10)
         self._notify = bool(config.get("notify", True))
         self._only_new = bool(config.get("only_new", True))
-        # 音乐专辑订阅联动
-        self._music_sub = bool(config.get("music_sub", True))
         # 专辑搜索源顺序，默认网易云优先
         self._album_order = (config.get("album_order") or "netease,qq").strip()
         # 每次下载完成后是否清空 cache/_open（公开用户缓存目录）
@@ -133,14 +132,14 @@ class LxMusicDownloader(_PluginBase):
         except Exception:
             self._interval = 30
 
-        need_loop = self._enabled and (self._subscribes.strip() or self._music_sub)
+        need_loop = self._enabled
         if need_loop:
             self.save_data("done", self._done)
             cls = LxMusicDownloader
             cls._inst = self          # 后台线程始终取最新实例的配置
             logger.info(
                 f"【{self.plugin_name}】后台检查已排程 | 关键词订阅：{bool(self._subscribes.strip())} "
-                f"| 音乐专辑订阅：{self._music_sub} | 音质：{self._quality} "
+                f"| 音质：{self._quality} "
                 f"| 轮询间隔：{self._interval} 分钟"
             )
             import threading
@@ -299,12 +298,11 @@ class LxMusicDownloader(_PluginBase):
 
         # 行3：音乐订阅
         rows.append({"component": "VRow", "content": [
-            col(4, switch("music_sub", "联动 MoviePilot 音乐订阅", "订阅里的专辑自动下载到 LX音乐")),
-            col(4, select("quality", "下载音质",
+            col(6, select("quality", "下载音质",
                           [{"title": "FLAC 无损", "value": "flac"},
                            {"title": "320k 高音质（推荐）", "value": "320k"},
                            {"title": "128k 标准", "value": "128k"}])),
-            col(4, select("album_order", "专辑搜索源顺序",
+            col(6, select("album_order", "专辑搜索源顺序",
                           [{"title": "网易云 → QQ（推荐）", "value": "netease,qq"},
                            {"title": "QQ → 网易云", "value": "qq,netease"},
                            {"title": "仅网易云", "value": "netease"},
@@ -313,12 +311,11 @@ class LxMusicDownloader(_PluginBase):
 
         # 行4：关键词订阅
         rows.append({"component": "VRow", "content": [
-            col(8, {"component": "VTextarea", "props": {
+            col(12, {"component": "VTextarea", "props": {
                 "model": "subscribes", "label": "订阅歌手 / 关键词（每行一个）",
                 "rows": 3, "variant": "outlined", "density": "comfortable",
                 "placeholder": "周杰伦\n林俊杰\n五月天",
             }}),
-            col(4, field("limit", "每个订阅最多下载", "10", "number")),
         ]})
 
         # 行5：轮询与清理
@@ -358,10 +355,8 @@ class LxMusicDownloader(_PluginBase):
             "server_url": "http://127.0.0.1:8142",
             "token": "",
             "quality": "320k",
-            "music_sub": True,
             "album_order": "netease,qq",
             "subscribes": "",
-            "limit": 10,
             "interval": 30,
             "clear_open_cache": True,
             "min_size_kb": 500,
@@ -369,6 +364,82 @@ class LxMusicDownloader(_PluginBase):
             "lx_user": "admin",
             "lx_admin_pwd": "",
         }
+
+    # ------------------------------------------------- 专辑封面
+    @staticmethod
+    def _cover_key(name: str, keyword: str = "") -> str:
+        raw = f"{name or ''}|{keyword or ''}"
+        norm = unicodedata.normalize("NFKC", raw)
+        return "".join(ch for ch in norm if ch.isalnum() or ch in "|-")
+
+    def _cover_map(self) -> dict:
+        try:
+            data = self.get_data("album_covers") or {}
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _cover_save(self, mapping: dict) -> None:
+        try:
+            self.save_data("album_covers", mapping)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"【{self.plugin_name}】封面缓存写入失败：{e}")
+
+    def _cover_lookup(self, name: str, keyword: str = "") -> str:
+        """通过 lxserver 搜索取专辑封面，优先专辑名匹配，命中后写缓存。"""
+        key = self._cover_key(name, keyword)
+        cache = self._cover_map()
+        if cache.get(key):
+            return cache[key]
+        try:
+            r = requests.get(f"{self._server_url}/api/music/search",
+                             params={"name": keyword or name, "token": self._token},
+                             headers=self._headers(), timeout=15)
+            data = r.json() if r.status_code == 200 else None
+            # lxserver 返回 {"list": [...]}，也兼容直接返回列表
+            rows = (data.get("list") if isinstance(data, dict) else data) or []
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"【{self.plugin_name}】取封面失败「{name}」：{e}")
+            return ""
+        if not isinstance(rows, list) or not rows:
+            return ""
+        target = "".join(ch for ch in unicodedata.normalize("NFKC", name or "") if ch.isalnum())
+        pick = None
+        for song in rows:
+            album = song.get("albumName") or song.get("album") or ""
+            norm = "".join(ch for ch in unicodedata.normalize("NFKC", album) if ch.isalnum())
+            if target and norm and (norm == target or target in norm or norm in target):
+                pick = song
+                break
+        if pick is None:
+            pick = rows[0]
+        url = (pick or {}).get("img") or ""
+        if not url:
+            return ""
+        url = url.replace("http://", "https://")
+        if "?" not in url:
+            url += "?param=300y300"
+        cache[key] = url
+        self._cover_save(cache)
+        return url
+
+    def _cover_prefetch(self, pairs) -> None:
+        """后台补封面，不阻塞页面渲染与订阅处理。"""
+        cache = self._cover_map()
+        todo = [(nm, kw) for nm, kw in pairs
+                if nm and not cache.get(self._cover_key(nm, kw))]
+        if not todo:
+            return
+
+        def _run():
+            for nm, kw in todo[:12]:
+                try:
+                    self._cover_lookup(nm, kw)
+                except Exception:  # noqa: BLE001
+                    pass
+                time.sleep(0.3)
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def get_page(self) -> List[dict]:
         """插件详情页：卡片式布局（统计概览 + 动作区 + 最近处理 + 流程说明）。
@@ -429,27 +500,52 @@ class LxMusicDownloader(_PluginBase):
              "content": [_btn("清理缓存", "mdi-broom", "warning", "clear_open", "tonal")]},
         ]}]
 
-        recent = list(processed.items())[-8:]
-        if recent:
-            lines = []
-            for sid, rec in recent:
-                rec = rec or {}
-                nm = rec.get("name") or f"订阅 #{sid}"
-                cnt = rec.get("count") or rec.get("tracks") or ""
-                lines.append({"component": "div",
-                              "props": {"class": "text-body-2 py-1"},
-                              "text": f"· {nm}" + (f" · {cnt} 首" if cnt else "")})
+        recs = sorted((rec or {} for rec in processed.values()),
+                      key=lambda r: r.get("at") or "", reverse=True)[:9]
+        if recs:
+            covers = self._cover_map()
+            self._cover_prefetch([(r.get("name") or "", r.get("keyword") or r.get("name") or "")
+                                  for r in recs])
             rows.append({"component": "VRow", "content": [
                 {"component": "VCol", "props": {"cols": 12}, "content": [
-                    {"component": "VCard", "props": {"variant": "outlined"}, "content": [
-                        {"component": "VCardText", "content": [
-                            {"component": "div",
-                             "props": {"class": "text-subtitle-2 font-weight-bold mb-1"},
-                             "text": "最近处理的专辑"},
-                        ] + lines},
-                    ]},
+                    {"component": "div",
+                     "props": {"class": "text-subtitle-2 font-weight-bold mb-1"},
+                     "text": "最近处理的专辑"},
                 ]},
             ]})
+            cards = []
+            for rec in recs:
+                nm = rec.get("name") or "未知专辑"
+                kw = rec.get("keyword") or nm
+                art = rec.get("artist") or ""
+                at = (rec.get("at") or "")[5:16]
+                cnt = rec.get("count") or rec.get("tracks") or ""
+                url = covers.get(self._cover_key(nm, kw)) or ""
+                if url:
+                    media = {"component": "VImg",
+                             "props": {"src": url, "height": 150, "cover": True}}
+                else:
+                    media = {"component": "div",
+                             "props": {"class": "d-flex align-center justify-center",
+                                       "style": "height:150px;background:rgba(var(--v-theme-on-surface),0.06)"},
+                             "content": [{"component": "VIcon",
+                                          "props": {"icon": "mdi-music-note", "size": 40,
+                                                    "color": "medium-emphasis"}}]}
+                meta = " · ".join(x for x in (art, f"{cnt} 首" if cnt else "", at) if x)
+                cards.append({"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                    {"component": "VCard", "props": {"variant": "outlined", "height": "100%"},
+                     "content": [media,
+                                 {"component": "VCardText", "props": {"class": "py-2"},
+                                  "content": [
+                                      {"component": "div",
+                                       "props": {"class": "text-subtitle-2 font-weight-bold text-truncate"},
+                                       "text": nm},
+                                      {"component": "div",
+                                       "props": {"class": "text-caption text-medium-emphasis"},
+                                       "text": meta},
+                                  ]}]}]})
+            for i in range(0, len(cards), 3):
+                rows.append({"component": "VRow", "content": cards[i:i + 3]})
 
         rows.append({"component": "VRow", "content": [
             {"component": "VCol", "props": {"cols": 12}, "content": [
@@ -768,7 +864,7 @@ class LxMusicDownloader(_PluginBase):
             # 始终使用最新实例（reload 后配置才会生效，且不会出现多线程并行）
             inst = LxMusicDownloader._inst or self
             try:
-                if not (inst._enabled and inst._music_sub):
+                if not inst._enabled:
                     time.sleep(60)
                     continue
                 inst.music_subscribe_check()
@@ -785,7 +881,7 @@ class LxMusicDownloader(_PluginBase):
                 logger.error(f"【{self.plugin_name}】缓存入库异常：{e}")
             # 核对订阅专辑的曲目数，缺的补齐（只在订阅范围内，不碰无关歌曲）
             try:
-                if inst._enabled and inst._music_sub:
+                if inst._enabled:
                     _fn, _fmsg = inst.check_subscribed_albums()
                     if _fn:
                         logger.info(f"【{self.plugin_name}】专辑补全：{_fmsg}")
@@ -793,7 +889,7 @@ class LxMusicDownloader(_PluginBase):
                 logger.error(f"【{self.plugin_name}】专辑补全异常：{e}")
             # 把音乐库实际曲目数写回 MP 订阅，让「订阅-音乐」显示 N/M 而不是恒 0/M
             try:
-                if inst._enabled and inst._music_sub:
+                if inst._enabled:
                     _pn, _pmsg = inst.sync_subscribe_progress()
                     if _pn:
                         logger.info(f"【{self.plugin_name}】订阅进度写回：{_pmsg}")
@@ -827,7 +923,7 @@ class LxMusicDownloader(_PluginBase):
         logger.info(f"【{self.plugin_name}】开始订阅检查，共 {len(kws)} 个关键词")
         total = 0
         for kw in kws:
-            songs = self.search(kw, limit=self._limit)
+            songs = self.search(kw, limit=self._PER_SUB_LIMIT)
             logger.info(f"【{self.plugin_name}】搜索「{kw}」命中 {len(songs)} 首")
             for s in songs:
                 if self.download(s):
@@ -2213,6 +2309,10 @@ class LxMusicDownloader(_PluginBase):
                 "at": time.strftime("%Y-%m-%d %H:%M:%S"),
             }
             self.save_data("music_subs", {"baseline": baseline, "processed": processed})
+            try:
+                self._cover_prefetch([(a.get("name") or "", _kw or a.get("name") or "")])
+            except Exception:  # noqa: BLE001
+                pass
             if self._notify:
                 try:
                     self.post_message(
@@ -2593,7 +2693,6 @@ class LxMusicDownloader(_PluginBase):
         processed = state.get("processed") or {}
         return {
             "enabled": self._enabled,
-            "music_subscribe": self._music_sub,
             "quality": self._quality,
             "album_order": self._album_order,
             "baseline_count": len(state.get("baseline") or []),
