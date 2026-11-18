@@ -69,7 +69,7 @@ class DownloadMonitor(_PluginBase):
     plugin_desc = "把全部下载器的全部任务桥接进 MoviePilot 原生下载管理"
     plugin_icon = ""
     plugin_color = "#1976D2"
-    plugin_version = "3.2.3"
+    plugin_version = "3.2.4"
     plugin_author = "虾虾"
     author_url = "https://github.com/meeryang/MoviePilot-Plugins"
     plugin_config_prefix = "downloadmonitor_"
@@ -923,11 +923,12 @@ class DownloadMonitor(_PluginBase):
                 for key in total:
                     total[key] += stat.get(key, 0)
 
-        def card(stat: Dict[str, int]) -> List[dict]:
-            tiles = [self._stat_tile(label, stat.get(key, 0), icon, 3)
+        def card(stat: Dict[str, int], tile_md: int = 3, per_row: int = 4) -> List[dict]:
+            """把 7 项指标排成若干行；tile_md 控制每个指标占的宽度。"""
+            tiles = [self._stat_tile(label, stat.get(key, 0), icon, tile_md)
                      for key, label, icon in self._STAT_ITEMS]
-            return [{"component": "VRow", "content": tiles[:4]},
-                    {"component": "VRow", "content": tiles[4:]}]
+            return [{"component": "VRow", "content": tiles[i:i + per_row]}
+                    for i in range(0, len(tiles), per_row)]
 
         content.append({"component": "VRow", "content": [
             {"component": "VCol", "props": {"cols": 12}, "content": [
@@ -946,16 +947,20 @@ class DownloadMonitor(_PluginBase):
         ]})
 
         # ---- 每个下载器一张卡 ----
+        dl_cols: List[dict] = []
         for name in sorted(stats):
             stat = stats[name]
-            content.append({"component": "VRow", "content": [
-                {"component": "VCol", "props": {"cols": 12}, "content": [
-                    {"component": "VCard", "props": {"variant": "outlined"}, "content": [
-                        {"component": "VCardText", "content": [
-                            {"component": "div",
-                             "props": {"class": "text-subtitle-2 font-weight-bold mb-2"},
-                             "text": f"{name}（共 {stat['total']} 个任务）"},
-                        ] + card(stat)}]}]}]})
+            dl_cols.append({
+                "component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                    {"component": "VCard", "props": {"variant": "outlined", "height": "100%"},
+                     "content": [{"component": "VCardText", "content": [
+                         {"component": "div",
+                          "props": {"class": "text-subtitle-2 font-weight-bold mb-2"},
+                          "text": f"{name}（共 {stat['total']} 个任务）"},
+                     ] + card(stat, tile_md=6, per_row=2)}]}]})
+        # 固定两个框一行，从左到右排列，数量不足时只占一半宽度
+        for i in range(0, len(dl_cols), 2):
+            content.append({"component": "VRow", "content": dl_cols[i:i + 2]})
 
         content.append({"component": "VRow", "content": [
             {"component": "VCol", "props": {"cols": 12}, "content": [
