@@ -72,7 +72,7 @@ class LxMusicDownloader(_PluginBase):
     plugin_name = "LX音乐下载"
     plugin_desc = "音乐专辑订阅联动：订阅-音乐新增专辑时按网易云/QQ 搜索整张专辑并经 LX音乐下载；支持音质选择"
     plugin_icon = "https://gitee.com/makimayang/obsidian/raw/main/icon.png"
-    plugin_version = "4.1.1"
+    plugin_version = "4.2.2"
     plugin_author = "虾虾"
     author_url = ""
     plugin_config_prefix = "lxmusicdownloader_"
@@ -85,6 +85,9 @@ class LxMusicDownloader(_PluginBase):
     _token: str = ""
     _quality: str = "320k"
     _subscribes: str = ""
+    # MP 音乐订阅快照缓存
+    _mp_subs_cache: dict = {}
+    _mp_subs_ts: float = 0.0
     # 每个订阅最多下载的歌曲数（固定值，原配置项已移除）
     _PER_SUB_LIMIT: int = 10
     _notify: bool = True
@@ -365,76 +368,158 @@ class LxMusicDownloader(_PluginBase):
             "lx_admin_pwd": "",
         }
 
-    # ------------------------------------------------- 专辑封面
+    # ------------------------------------------------- 专辑封面与元数据（取自 MoviePilot）
     @staticmethod
-    def _cover_key(name: str, keyword: str = "") -> str:
-        raw = f"{name or ''}|{keyword or ''}"
-        norm = unicodedata.normalize("NFKC", raw)
-        return "".join(ch for ch in norm if ch.isalnum() or ch in "|-")
+    def _norm(text: str) -> str:
+        """归一化名称用于匹配：去掉标点空白，统一大小写。"""
+        raw = unicodedata.normalize("NFKC", str(text or ""))
+        return "".join(ch for ch in raw if ch.isalnum()).lower()
 
-    def _cover_map(self) -> dict:
+    def _mp_api(self, path: str, **params):
+        """调用 MoviePilot 自己的 REST 接口（插件与 MP 同进程，走 127.0.0.1）。"""
         try:
-            data = self.get_data("album_covers") or {}
+            from app.core.config import settings
+            port = getattr(settings, "PORT", 3000) or 3000
+            params["apikey"] = getattr(settings, "API_TOKEN", "") or ""
+            r = requests.get(f"http://127.0.0.1:{port}/api/v1{path}",
+                             params=params, timeout=20)
+            if r.status_code != 200:
+                logger.debug(f"【{self.plugin_name}】MP 接口 {path} 返回 {r.status_code}")
+                return None
+            data = r.json()
+            if isinstance(data, dict) and "data" in data:
+                return data["data"]
+            return data
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"【{self.plugin_name}】调用 MP 接口 {path} 失败：{e}")
+            return None
+
+    def _mp_music_subs(self) -> dict:
+        """MP 侧音乐订阅快照：专辑名 → {poster, year, date, media_id, media_source}。"""
+        now = time.time()
+        if LxMusicDownloader._mp_subs_cache and \
+                now - LxMusicDownloader._mp_subs_ts < 300:
+            return LxMusicDownloader._mp_subs_cache
+        rows = self._mp_api("/subscribe/") or []
+        out = {}
+        for row in rows if isinstance(rows, list) else []:
+            if row.get("type") != "音乐":
+                continue
+            key = self._norm(row.get("name"))
+            if key:
+                out[key] = row
+        LxMusicDownloader._mp_subs_cache = out
+        LxMusicDownloader._mp_subs_ts = now
+        return out
+
+    def _album_meta_map(self) -> dict:
+        try:
+            data = self.get_data("album_meta") or {}
             return data if isinstance(data, dict) else {}
-        except Exception:
+        except Exception:  # noqa: BLE001
             return {}
 
-    def _cover_save(self, mapping: dict) -> None:
+    def _album_meta_save(self, mapping: dict) -> None:
         try:
-            self.save_data("album_covers", mapping)
+            self.save_data("album_meta", mapping)
         except Exception as e:  # noqa: BLE001
-            logger.debug(f"【{self.plugin_name}】封面缓存写入失败：{e}")
+            logger.debug(f"【{self.plugin_name}】专辑元数据写入失败：{e}")
 
-    def _cover_lookup(self, name: str, keyword: str = "") -> str:
-        """通过 lxserver 搜索取专辑封面，优先专辑名匹配，命中后写缓存。"""
-        key = self._cover_key(name, keyword)
-        cache = self._cover_map()
-        if cache.get(key):
-            return cache[key]
-        try:
-            r = requests.get(f"{self._server_url}/api/music/search",
-                             params={"name": keyword or name, "token": self._token},
-                             headers=self._headers(), timeout=15)
-            data = r.json() if r.status_code == 200 else None
-            # lxserver 返回 {"list": [...]}，也兼容直接返回列表
-            rows = (data.get("list") if isinstance(data, dict) else data) or []
-        except Exception as e:  # noqa: BLE001
-            logger.debug(f"【{self.plugin_name}】取封面失败「{name}」：{e}")
-            return ""
-        if not isinstance(rows, list) or not rows:
-            return ""
-        target = "".join(ch for ch in unicodedata.normalize("NFKC", name or "") if ch.isalnum())
-        pick = None
-        for song in rows:
-            album = song.get("albumName") or song.get("album") or ""
-            norm = "".join(ch for ch in unicodedata.normalize("NFKC", album) if ch.isalnum())
-            if target and norm and (norm == target or target in norm or norm in target):
-                pick = song
-                break
-        if pick is None:
-            pick = rows[0]
-        url = (pick or {}).get("img") or ""
-        if not url:
-            return ""
-        url = url.replace("http://", "https://")
-        if "?" not in url:
-            url += "?param=300y300"
-        cache[key] = url
-        self._cover_save(cache)
-        return url
+    @staticmethod
+    def _quoted_album(msg: str) -> str:
+        """处理结果里带「专辑「XXX」」，用它兜底匹配 MP 订阅名。"""
+        m = re.search(r"专辑「(.+?)」", str(msg or ""))
+        return m.group(1).strip() if m else ""
 
-    def _cover_prefetch(self, pairs) -> None:
-        """后台补封面，不阻塞页面渲染与订阅处理。"""
-        cache = self._cover_map()
-        todo = [(nm, kw) for nm, kw in pairs
-                if nm and not cache.get(self._cover_key(nm, kw))]
+    def _mp_sub_for(self, name: str, keyword: str, msg: str = "") -> dict:
+        """在 MP 音乐订阅里按 精确名 → 关键词 → 引号内专辑名 → 模糊包含 依次匹配。"""
+        subs = self._mp_music_subs()
+        for cand in (name, keyword, self._quoted_album(msg)):
+            key = self._norm(cand)
+            if key and key in subs:
+                return subs[key]
+        target = self._norm(name)
+        if target:
+            for key, row in subs.items():
+                if key and (target in key or key in target):
+                    return row
+        return {}
+
+    def _lx_cover(self, name: str, keyword: str = "", msg: str = "") -> dict:
+        """回退：MP 无此专辑时用 lxserver 搜索，要求专辑名匹配，宁可无封面也不张冠李戴。"""
+        for cand in (self._quoted_album(msg), name, keyword):
+            target = self._norm(cand)
+            if not target:
+                continue
+            try:
+                r = requests.get(f"{self._server_url}/api/music/search",
+                                 params={"name": cand, "token": self._token},
+                                 headers=self._headers(), timeout=15)
+                data = r.json() if r.status_code == 200 else None
+                rows = (data.get("list") if isinstance(data, dict) else data) or []
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"【{self.plugin_name}】lxserver 取封面失败「{cand}」：{e}")
+                continue
+            if not isinstance(rows, list):
+                continue
+            for song in rows:
+                album_key = self._norm(song.get("albumName"))
+                if album_key and album_key == target:
+                    cover = (song.get("img") or "").replace("http://", "https://")
+                    if cover and "?" not in cover:
+                        cover += "?param=300y300"
+                    return {"cover": cover, "artist": song.get("singer") or ""}
+        return {}
+
+    def _album_meta_build(self, name: str, keyword: str, organize_at: str,
+                          msg: str = "") -> dict:
+        """单张专辑的展示信息：优先 MP（封面/歌手/推出日期/添加日期），缺口回退 lxserver。"""
+        sub = self._mp_sub_for(name, keyword, msg)
+        meta = {
+            "name": sub.get("name") or name,
+            "artist": "",
+            "release": str(sub.get("year") or ""),
+            "added": (sub.get("date") or "")[:10],
+            "organize": (organize_at or "")[:10],
+            "cover": sub.get("poster") or "",
+            "source": "mp" if sub else "",
+        }
+        media_id, media_source = sub.get("media_id"), sub.get("media_source")
+        if media_id and media_source:
+            detail = self._mp_api(f"/music/album/{media_id}", media_source=media_source) or {}
+            if isinstance(detail, dict) and detail:
+                artists = detail.get("artists") or []
+                meta["artist"] = detail.get("artist") or (artists[0] if artists else "")
+                meta["release"] = (detail.get("release_date")
+                                   or str(detail.get("original_year") or "") or meta["release"])
+                meta["cover"] = meta["cover"] or detail.get("cover_url") \
+                    or detail.get("poster_path") or ""
+        if not meta["cover"] or not meta["artist"]:
+            fb = self._lx_cover(name, keyword, msg)
+            meta["cover"] = meta["cover"] or fb.get("cover") or ""
+            meta["artist"] = meta["artist"] or fb.get("artist") or ""
+            if fb and not meta["source"]:
+                meta["source"] = "lx"
+        return meta
+
+    def _album_meta_fill(self, recs) -> None:
+        """后台补齐缺失的专辑元数据，不阻塞页面渲染。"""
+        cache = self._album_meta_map()
+        todo = []
+        for rec in recs:
+            nm = rec.get("name") or ""
+            if nm and not cache.get(self._norm(nm)):
+                todo.append((nm, rec.get("keyword") or nm,
+                             rec.get("at") or "", rec.get("msg") or ""))
         if not todo:
             return
 
         def _run():
-            for nm, kw in todo[:12]:
+            for nm, kw, at, msg in todo[:12]:
                 try:
-                    self._cover_lookup(nm, kw)
+                    meta = self._album_meta_build(nm, kw, at, msg)
+                    cache[self._norm(nm)] = meta
+                    self._album_meta_save(cache)
                 except Exception:  # noqa: BLE001
                     pass
                 time.sleep(0.3)
@@ -503,9 +588,8 @@ class LxMusicDownloader(_PluginBase):
         recs = sorted((rec or {} for rec in processed.values()),
                       key=lambda r: r.get("at") or "", reverse=True)[:9]
         if recs:
-            covers = self._cover_map()
-            self._cover_prefetch([(r.get("name") or "", r.get("keyword") or r.get("name") or "")
-                                  for r in recs])
+            metas = self._album_meta_map()
+            self._album_meta_fill(recs)
             rows.append({"component": "VRow", "content": [
                 {"component": "VCol", "props": {"cols": 12}, "content": [
                     {"component": "div",
@@ -514,36 +598,53 @@ class LxMusicDownloader(_PluginBase):
                 ]},
             ]})
             cards = []
+            seen_album = set()
             for rec in recs:
                 nm = rec.get("name") or "未知专辑"
-                kw = rec.get("keyword") or nm
-                art = rec.get("artist") or ""
-                at = (rec.get("at") or "")[5:16]
-                cnt = rec.get("count") or rec.get("tracks") or ""
-                url = covers.get(self._cover_key(nm, kw)) or ""
-                if url:
-                    media = {"component": "VImg",
-                             "props": {"src": url, "height": 150, "cover": True}}
+                meta = metas.get(self._norm(nm)) or {}
+                album_key = self._norm(meta.get("name") or nm)
+                if album_key in seen_album:
+                    continue
+                seen_album.add(album_key)
+                cover = meta.get("cover") or ""
+                artist = meta.get("artist") or rec.get("artist") or "—"
+                release = meta.get("release") or "—"
+                added = meta.get("added") or "—"
+                organize = meta.get("organize") or (rec.get("at") or "")[:10] or "—"
+                if cover:
+                    body = {"component": "VImg",
+                            "props": {"src": cover, "cover": True,
+                                      "height": "100%", "width": "100%"}}
                 else:
-                    media = {"component": "div",
-                             "props": {"class": "d-flex align-center justify-center",
-                                       "style": "height:150px;background:rgba(var(--v-theme-on-surface),0.06)"},
-                             "content": [{"component": "VIcon",
-                                          "props": {"icon": "mdi-music-note", "size": 40,
-                                                    "color": "medium-emphasis"}}]}
-                meta = " · ".join(x for x in (art, f"{cnt} 首" if cnt else "", at) if x)
+                    body = {"component": "div",
+                            "props": {"class": "d-flex align-center justify-center",
+                                      "style": "height:100%;"
+                                               "background:rgba(var(--v-theme-on-surface),0.06)"},
+                            "content": [{"component": "VIcon",
+                                         "props": {"icon": "mdi-music-note", "size": 40,
+                                                   "color": "medium-emphasis"}}]}
+
+                def line(label: str, value: str) -> dict:
+                    return {"component": "div",
+                            "props": {"class": "text-caption text-medium-emphasis text-truncate"},
+                            "text": f"{label}：{value}"}
+
                 cards.append({"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
                     {"component": "VCard", "props": {"variant": "outlined", "height": "100%"},
-                     "content": [media,
-                                 {"component": "VCardText", "props": {"class": "py-2"},
-                                  "content": [
-                                      {"component": "div",
-                                       "props": {"class": "text-subtitle-2 font-weight-bold text-truncate"},
-                                       "text": nm},
-                                      {"component": "div",
-                                       "props": {"class": "text-caption text-medium-emphasis"},
-                                       "text": meta},
-                                  ]}]}]})
+                     "content": [
+                         {"component": "div",
+                          "props": {"style": "aspect-ratio:1/1;overflow:hidden"},
+                          "content": [body]},
+                         {"component": "VCardText", "props": {"class": "py-2"}, "content": [
+                             {"component": "div",
+                              "props": {"class": "text-subtitle-2 font-weight-bold text-truncate mb-1"},
+                              "text": nm},
+                             line("歌手", artist),
+                             line("推出", str(release)),
+                             line("添加", added),
+                             line("整理", organize),
+                         ]},
+                     ]}]})
             for i in range(0, len(cards), 3):
                 rows.append({"component": "VRow", "content": cards[i:i + 3]})
 
@@ -2310,7 +2411,9 @@ class LxMusicDownloader(_PluginBase):
             }
             self.save_data("music_subs", {"baseline": baseline, "processed": processed})
             try:
-                self._cover_prefetch([(a.get("name") or "", _kw or a.get("name") or "")])
+                self._album_meta_fill([{"name": a.get("name") or "",
+                                        "keyword": _kw or a.get("name") or "",
+                                        "at": time.strftime("%Y-%m-%d %H:%M:%S")}])
             except Exception:  # noqa: BLE001
                 pass
             if self._notify:
