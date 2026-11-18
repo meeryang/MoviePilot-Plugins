@@ -69,7 +69,7 @@ class DownloadMonitor(_PluginBase):
     plugin_desc = "把全部下载器的全部任务桥接进 MoviePilot 原生下载管理"
     plugin_icon = ""
     plugin_color = "#1976D2"
-    plugin_version = "3.1.4"
+    plugin_version = "3.2.3"
     plugin_author = "虾虾"
     author_url = "https://github.com/meeryang/MoviePilot-Plugins"
     plugin_config_prefix = "downloadmonitor_"
@@ -94,6 +94,10 @@ class DownloadMonitor(_PluginBase):
     _poster_lock = threading.Lock()
     _poster_dirty: int = 0
     _poster_started: bool = False
+    # 原生状态统计缓存
+    _raw_stats_cache: Dict[str, Dict[str, int]] = {}
+    _raw_stats_ts: float = 0.0
+    _raw_merged: Dict[str, int] = {}
     _poster_file: Optional[Path] = None
     # 仪表板短时缓存（类级，避免频繁打下载器）
     _cache: Optional[List[dict]] = None
@@ -694,35 +698,192 @@ class DownloadMonitor(_PluginBase):
         return [{"component": "VForm", "content": rows}], defaults
 
     # ------------------------------------------------------------------ 插件页
-    def get_page(self) -> Optional[List[dict]]:
-        """插件详情页：卡片式布局，与 LX 音乐插件保持一致。
+    # ------------------------------------------------- 原生状态统计（7 分类）
+    # 顺序即页面展示顺序：(键, 中文, 图标)
+    _STAT_ITEMS = (
+        ("downloading", "下载中", "mdi-download"),
+        ("uploading", "上传中", "mdi-arrow-up-bold"),
+        ("seeding", "做种中", "mdi-upload"),
+        ("completed", "完成", "mdi-check-circle-outline"),
+        ("paused", "暂停", "mdi-pause"),
+        ("stopped", "停止", "mdi-stop"),
+        ("error", "错误", "mdi-alert-circle-outline"),
+    )
+    # 下载器原生状态 → 分类（MP 会把状态归一成 downloading/completed/paused，
+    # 想把「做种 / 停止 / 错误」分出来就必须直接读下载器原始状态）
+    _RAW_BUCKET = {
+        # qBittorrent
+        "downloading": "downloading", "forceddl": "downloading", "stalleddl": "downloading",
+        "queueddl": "downloading", "checkingdl": "downloading", "metadl": "downloading",
+        "allocating": "downloading",
+        "uploading": "seeding", "forcedup": "seeding", "stalledup": "seeding",
+        "queuedup": "seeding", "checkingup": "seeding",
+        "pauseddl": "paused", "pausedup": "paused",
+        "stoppeddl": "stopped", "stoppedup": "stopped",
+        "error": "error", "missingfiles": "error",
+        # Transmission
+        "downloading": "downloading", "download pending": "downloading",
+        "seeding": "seeding", "seed pending": "seeding",
+        "stopped": "paused",  # Transmission 只有 stopped，语义即暂停
+        "isolated": "error",
+    }
 
-        顶部四张统计卡 → 动作按钮行 → 下载器分布 → 说明。
+    # Transmission 的 status 可能是数字（RPC 原始值）或字符串
+    _TR_STATUS = {0: "stopped", 1: "check pending", 2: "checking", 3: "download pending",
+                  4: "downloading", 5: "seed pending", 6: "seeding"}
+
+    @classmethod
+    def _raw_fields(cls, item: Any) -> Tuple[str, float, float, str]:
+        """从原始任务对象里取 (状态文本, 进度%, 上传速度B/s, hash)。
+
+        qBittorrent 用 dict（state/progress/upspeed），Transmission 用对象或 dict
+        （status/percentDone 或 percent_done/rateUpload 或 rate_upload），两种都要兼容。
         """
-        rows = self._cached_rows()
-        total = len(rows)
-        downloading = sum(1 for r in rows if r.get("state_raw") == "downloading")
-        seeding = sum(1 for r in rows if r.get("state_raw") == "completed")
-        paused = sum(1 for r in rows if r.get("state_raw") == "paused")
+        raw: Any = ""
+        prog: Any = 0
+        ups: Any = 0
+        try:
+            if hasattr(item, "get"):
+                raw = item.get("state")
+                if raw in (None, ""):
+                    raw = item.get("status")
+                prog = item.get("progress")
+                if prog is None:
+                    prog = item.get("percentDone", item.get("percent_done"))
+                ups = item.get("upspeed")
+                if ups is None:
+                    ups = item.get("rateUpload", item.get("rate_upload"))
+            else:
+                raw = getattr(item, "status", None)
+                if raw in (None, ""):
+                    raw = getattr(item, "state", "")
+                prog = getattr(item, "percent_done", None)
+                if prog is None:
+                    prog = getattr(item, "percentDone", None)
+                if prog is None:
+                    prog = getattr(item, "progress", 0)
+                ups = getattr(item, "rate_upload", None)
+                if ups is None:
+                    ups = getattr(item, "rateUpload", 0)
+        except Exception:  # noqa: BLE001
+            return "", 0.0, 0.0, ""
+        if isinstance(raw, int) or (isinstance(raw, str) and raw.strip().isdigit()):
+            raw = cls._TR_STATUS.get(int(raw), "")
+        try:
+            prog_f = float(prog or 0)
+        except Exception:  # noqa: BLE001
+            prog_f = 0.0
+        if prog_f <= 1.0:  # 0-1 比例 → 百分比
+            prog_f *= 100
+        try:
+            ups_f = float(ups or 0)
+        except Exception:  # noqa: BLE001
+            ups_f = 0.0
+        hash_val = ""
+        try:
+            if hasattr(item, "get"):
+                hash_val = str(item.get("hash") or item.get("hashString") or "")
+            else:
+                hash_val = str(getattr(item, "hash_string", "") or getattr(item, "hash", "") or "")
+        except Exception:  # noqa: BLE001
+            hash_val = ""
+        return str(raw or "").strip().lower(), prog_f, ups_f, hash_val.strip().lower()
 
-        per_dl: Dict[str, Dict[str, int]] = {}
-        for row in rows:
-            name = row.get("downloader") or "未知"
-            bucket = per_dl.setdefault(name, {"total": 0, "downloading": 0, "seeding": 0})
-            bucket["total"] += 1
-            if row.get("state_raw") == "downloading":
-                bucket["downloading"] += 1
-            elif row.get("state_raw") == "completed":
-                bucket["seeding"] += 1
+    @classmethod
+    def _bucket_of(cls, raw: str, prog: float) -> str:
+        hit = cls._RAW_BUCKET.get(raw)
+        if hit:
+            return hit
+        return "completed" if prog >= 99.9 else "downloading"
 
-        def btn(text: str, icon: str, color: str, onclick: str,
-                variant: str = "flat") -> dict:
+    @staticmethod
+    def _empty_stat() -> Dict[str, int]:
+        stat = {key: 0 for key, _, _ in DownloadMonitor._STAT_ITEMS}
+        stat["total"] = 0
+        stat["other"] = 0
+        return stat
+
+    def _raw_stats(self) -> Dict[str, Dict[str, int]]:
+        """按下载器实例统计原生状态；带 10 秒缓存，避免拖慢页面。"""
+        now = time.time()
+        if DownloadMonitor._raw_stats_cache and now - DownloadMonitor._raw_stats_ts < 10:
+            return DownloadMonitor._raw_stats_cache
+        result: Dict[str, Dict[str, int]] = {}
+        try:
+            from app.application.module import get_module_manager
+            mods = list(get_module_manager().get_running_modules("list_torrents") or [])
+        except Exception as err:  # noqa: BLE001
+            logger.debug(f"【下载任务监控】枚举下载器模块失败：{err}")
+            return result
+        merged = self._empty_stat()
+        seen_hash: set = set()
+        seen_up: set = set()
+        for name in DownloadMonitor._downloader_names():
+            for mod in mods:
+                try:
+                    inst = mod.get_instance(name)
+                except Exception:  # noqa: BLE001
+                    inst = None
+                if not inst:
+                    continue
+                items = None
+                try:
+                    got = inst.get_torrents()
+                    items = got[0] if isinstance(got, tuple) else got
+                except Exception as err:  # noqa: BLE001
+                    logger.debug(f"【下载任务监控】读取 {name} 原始任务失败：{err}")
+                if items is None:
+                    continue
+                stat = self._empty_stat()
+                for item in items:
+                    raw, prog, ups, hash_val = self._raw_fields(item)
+                    bucket = self._bucket_of(raw, prog)
+                    stat["total"] += 1
+                    if bucket in stat:
+                        stat[bucket] += 1
+                    else:
+                        stat["other"] += 1
+                    if ups > 0:  # 上传中＝当前真有上传流量（做种中的活跃子集）
+                        stat["uploading"] += 1
+                    # 同一个种子可能同时挂在两个下载器上，跨下载器按 hash 去重
+                    if hash_val and hash_val not in seen_hash:
+                        seen_hash.add(hash_val)
+                        merged["total"] += 1
+                        if bucket in merged:
+                            merged[bucket] += 1
+                        else:
+                            merged["other"] += 1
+                    if ups > 0 and (not hash_val or hash_val not in seen_up):
+                        if hash_val:
+                            seen_up.add(hash_val)
+                        merged["uploading"] += 1
+                result[name] = stat
+                break
+        DownloadMonitor._raw_stats_cache = result
+        DownloadMonitor._raw_merged = merged
+        DownloadMonitor._raw_stats_ts = now
+        return result
+
+    def _stat_tile(self, label: str, value: int, icon: str, md: int = 3) -> dict:
+        """下载器卡片里的一个小指标块。"""
+        return {"component": "VCol", "props": {"cols": 6, "md": md}, "content": [
+            {"component": "div", "props": {"class": "text-caption text-medium-emphasis"},
+             "text": label},
+            {"component": "div", "props": {"class": "text-subtitle-2 font-weight-bold"},
+             "text": str(value)},
+        ]}
+
+    # ------------------------------------------------- 插件页
+    def get_page(self) -> Optional[List[dict]]:
+        """插件页：全局统计（原生状态 7 分类）+ 每个下载器单独一张卡。"""
+        stats = self._raw_stats()
+
+        def btn(text: str, icon: str, color: str, onclick: str, variant: str = "flat") -> dict:
             return {"component": "VBtn",
                     "props": {"color": color, "variant": variant, "block": True,
                               "prepend-icon": icon, "onclick": onclick},
                     "text": text}
 
-        open_js = "function(e) { window.open('/downloading', '_blank'); }"
         rescan_js = (
             "function(e) {"
             "  window.MoviePilotAPI.post('plugin/DownloadMonitor/rescan', {})"
@@ -733,53 +894,77 @@ class DownloadMonitor(_PluginBase):
             "    .catch(function(err) { console.error(err); alert('失败，请查看日志'); });"
             "}"
         )
+        poster_js = (
+            "function(e) {"
+            "  window.MoviePilotAPI.post('plugin/DownloadMonitor/fill_posters', {})"
+            "    .then(function(r) {"
+            "      if (!r || r.success === false) { alert((r && r.message) || '失败'); return; }"
+            "      alert(r.message || '已入队');"
+            "    })"
+            "    .catch(function(err) { console.error(err); alert('失败，请查看日志'); });"
+            "}"
+        )
 
-        content: List[dict] = [{"component": "VRow", "content": [
-            self._stat_card("任务总数", str(total), "mdi-download-network", 6, 3),
-            self._stat_card("下载中", str(downloading), "mdi-download", 6, 3),
-            self._stat_card("做种/完成", str(seeding), "mdi-upload", 6, 3),
-            self._stat_card("暂停", str(paused), "mdi-pause", 6, 3),
-        ]}, {"component": "VRow", "content": [
-            {"component": "VCol", "props": {"cols": 12, "md": 6},
-             "content": [btn("打开原生下载管理", "mdi-monitor-dashboard", "primary", open_js)]},
-            {"component": "VCol", "props": {"cols": 12, "md": 6},
-             "content": [btn("重建任务归属缓存", "mdi-cached", "info", rescan_js, "tonal")]},
-        ]}]
+        content: List[dict] = []
+        if not stats:
+            content.append({"component": "VRow", "content": [
+                {"component": "VCol", "props": {"cols": 12}, "content": [
+                    {"component": "VAlert",
+                     "props": {"type": "warning", "variant": "tonal",
+                               "title": "读不到下载器",
+                               "text": "没有可用的下载器实例，请先在「设置-下载器」里配置并启用。"}}]}]})
+            return content
 
-        lines = []
-        for name, bucket in sorted(per_dl.items()):
-            lines.append({"component": "div",
-                          "props": {"class": "text-body-2 py-1"},
-                          "text": (f"· {name}：共 {bucket['total']} 条"
-                                   f"（下载中 {bucket['downloading']} · 做种 {bucket['seeding']}）")})
-        if not lines:
-            lines.append({"component": "div",
-                          "props": {"class": "text-body-2 py-1 text-medium-emphasis"},
-                          "text": "暂无任务数据"})
+        # ---- 全局合计 ----
+        total = dict(DownloadMonitor._raw_merged) or self._empty_stat()
+        if not total.get("total"):
+            total = self._empty_stat()
+            for stat in stats.values():
+                for key in total:
+                    total[key] += stat.get(key, 0)
+
+        def card(stat: Dict[str, int]) -> List[dict]:
+            tiles = [self._stat_tile(label, stat.get(key, 0), icon, 3)
+                     for key, label, icon in self._STAT_ITEMS]
+            return [{"component": "VRow", "content": tiles[:4]},
+                    {"component": "VRow", "content": tiles[4:]}]
+
         content.append({"component": "VRow", "content": [
             {"component": "VCol", "props": {"cols": 12}, "content": [
-                {"component": "VCard", "props": {"variant": "outlined"}, "content": [
-                    {"component": "VCardText", "content": [
-                        {"component": "div",
-                         "props": {"class": "text-subtitle-2 font-weight-bold mb-1"},
-                         "text": "下载器分布"},
-                    ] + lines},
-                ]},
-            ]},
+                {"component": "VCard", "props": {"variant": "tonal", "color": "primary"},
+                 "content": [{"component": "VCardText", "content": [
+                     {"component": "div",
+                      "props": {"class": "text-subtitle-2 font-weight-bold mb-2"},
+                      "text": f"全部下载器（去重共 {total['total']} 个任务）"}] + card(total)}]}]}]})
+
+        # ---- 动作按钮（已移除「打开原生下载管理」）----
+        content.append({"component": "VRow", "content": [
+            {"component": "VCol", "props": {"cols": 12, "md": 6},
+             "content": [btn("重建任务归属缓存", "mdi-cached", "info", rescan_js, "tonal")]},
+            {"component": "VCol", "props": {"cols": 12, "md": 6},
+             "content": [btn("补全任务封面", "mdi-image-search", "primary", poster_js, "tonal")]},
         ]})
 
-        bridge_text = ("已开启：原生「下载管理」显示全部下载器、全部状态的任务，"
-                       "并支持暂停 / 开始 / 删除 / 改标签 / 限速。"
-                       if self._bridge_native else
-                       "已关闭：恢复 MP 原生行为（只显示默认下载器的下载中任务）。")
+        # ---- 每个下载器一张卡 ----
+        for name in sorted(stats):
+            stat = stats[name]
+            content.append({"component": "VRow", "content": [
+                {"component": "VCol", "props": {"cols": 12}, "content": [
+                    {"component": "VCard", "props": {"variant": "outlined"}, "content": [
+                        {"component": "VCardText", "content": [
+                            {"component": "div",
+                             "props": {"class": "text-subtitle-2 font-weight-bold mb-2"},
+                             "text": f"{name}（共 {stat['total']} 个任务）"},
+                        ] + card(stat)}]}]}]})
+
         content.append({"component": "VRow", "content": [
             {"component": "VCol", "props": {"cols": 12}, "content": [
                 {"component": "VAlert",
-                 "props": {"type": "info" if self._bridge_native else "warning",
-                           "variant": "tonal", "title": "原生桥接状态",
-                           "text": bridge_text}},
-            ]},
-        ]})
+                 "props": {"type": "info", "variant": "tonal", "title": "统计说明",
+                           "text": "下载中 / 做种中 / 暂停 / 停止 / 错误均取下载器原生状态；"
+                                   "上传中＝当前确有上传流量（做种中的活跃子集，与做种中重叠）；"
+                                   "完成＝已下完但当前未做种；全部合计按 hash 去重"
+                                   "（部分种子同时挂在两个下载器上）。"}}]}]})
         return content
 
     def get_api(self) -> List[Dict[str, Any]]:
