@@ -7,6 +7,8 @@
 """
 
 import json
+import hashlib
+import os
 import re
 import threading
 import time
@@ -69,7 +71,7 @@ class DownloadMonitor(_PluginBase):
     plugin_desc = "把全部下载器的全部任务桥接进 MoviePilot 原生下载管理"
     plugin_icon = ""
     plugin_color = "#1976D2"
-    plugin_version = "3.2.4"
+    plugin_version = "3.3.0"
     plugin_author = "虾虾"
     author_url = "https://github.com/meeryang/MoviePilot-Plugins"
     plugin_config_prefix = "downloadmonitor_"
@@ -103,6 +105,63 @@ class DownloadMonitor(_PluginBase):
     _cache: Optional[List[dict]] = None
     _cache_ts: float = 0.0
 
+    # ---------- 前端「下载管理筛选栏」补丁 ----------
+    # 补丁标记：出现即认为已打过
+    _FE_MARK = "_dmS={bar:"
+    # 补丁写入位置：用户过滤锚点之后（setup 作用域，可用 n=ref / l=computed / f=任务列表）
+    _FE_HELPER = (
+        'const _dmS={bar:{display:"flex",gap:"8px",alignItems:"center",flexWrap:"wrap",'
+        'margin:"0 0 12px",padding:"8px 10px",border:"1px solid rgba(128,128,128,.28)",'
+        'borderRadius:"10px"},inp:{flex:"1 1 240px",minWidth:"160px",height:"34px",'
+        'padding:"0 10px",borderRadius:"8px",border:"1px solid rgba(128,128,128,.35)",'
+        'background:"transparent",color:"inherit",outline:"none",fontSize:"13px"},'
+        'chip:{height:"30px",padding:"0 11px",borderRadius:"15px",'
+        'border:"1px solid rgba(128,128,128,.35)",background:"transparent",color:"inherit",'
+        'cursor:"pointer",fontSize:"12.5px",lineHeight:"1",whiteSpace:"nowrap"},'
+        'chipOn:{height:"30px",padding:"0 11px",borderRadius:"15px",cursor:"pointer",'
+        'fontSize:"12.5px",lineHeight:"1",whiteSpace:"nowrap",fontWeight:"600",'
+        'color:"inherit",border:"1px solid rgba(var(--v-theme-primary,25,118,210),.65)",'
+        'background:"rgba(var(--v-theme-primary,25,118,210),.16)"},'
+        'cnt:{marginLeft:"auto",fontSize:"12px",opacity:".7",whiteSpace:"nowrap"},'
+        'emp:{padding:"8px 2px",fontSize:"13px",opacity:".7"}}'
+        ',_dmKind=t=>{const s=t.state||"",p=parseFloat(t.progress||"0")||0,'
+        'u=parseFloat(t.upspeed||"0")||0,dl=parseFloat(t.dlspeed||"0")||0;'
+        'return{all:!0,downloading:"downloading"===s,seeding:p>=100&&"paused"!==s,'
+        'uploading:u>0,active:dl>0||u>0,paused:"paused"===s}}'
+        ',_dmKw=n(""),_dmSt=n("all"),_dmLow=l((()=>_dmKw.value.trim().toLowerCase())),'
+        '_dmCnt=l((()=>{const a={all:f.value.length,downloading:0,seeding:0,uploading:0,'
+        'active:0,paused:0};for(const t of f.value){const k=_dmKind(t);'
+        'k.downloading&&a.downloading++;k.seeding&&a.seeding++;k.uploading&&a.uploading++;'
+        'k.active&&a.active++;k.paused&&a.paused++}return a})),'
+        '_dmFlt=l((()=>{const a=_dmLow.value,e=_dmSt.value;return f.value.filter((t=>{'
+        'if("all"!==e&&!_dmKind(t)[e])return!1;if(!a)return!0;'
+        'return[t.title,t.name,t.site_name,t.hash,t.downloader,t.tags]'
+        '.filter(Boolean).join(" ").toLowerCase().includes(a)}))}));'
+    )
+    # 渲染作用域里补一个创建节点的简写
+    _FE_ALIAS = ',_dmB=(...z)=>(d(),t(...z))'
+    # 筛选栏 vnode（插在 return d(),t(s,null,[ 之后）
+    _FE_BAR = (
+        '_dmB("div",{style:_dmS.bar},['
+        '_dmB("input",{style:_dmS.inp,'
+        'placeholder:"筛选任务：标题 / 番剧名 / 站点 / hash",value:_dmKw.value,'
+        'onInput:(a=>{_dmKw.value=a.target.value})},null,8,["value"]),'
+    ) + ''.join(
+        '_dmB("button",{style:("%s"===_dmSt.value?_dmS.chipOn:_dmS.chip),'
+        'onClick:(a=>{_dmSt.value="%s"})},"%s "+_dmCnt.value.%s,5),' % (k, k, label, k)
+        for k, label in (("all", "全部"), ("downloading", "下载中"), ("seeding", "做种"),
+                         ("uploading", "上传中"), ("active", "活动"), ("paused", "已暂停"))
+    ) + (
+        '_dmB("span",{style:_dmS.cnt},'
+        '"已筛选 "+_dmFlt.value.length+" / 共 "+f.value.length+" 条",1)],0),'
+        '(_(v)&&0===_dmFlt.value.length&&f.value.length>0)'
+        '?_dmB("div",{style:_dmS.emp},"没有匹配的任务，试试换个关键词或状态",1):m("",!0),'
+    )
+    # 锚点（上游结构未变时才能自动打）
+    _FE_ANCHOR_USER = 'filter((a=>a.userid===e||a.username===e))}))'
+    _FE_ANCHOR_RENDER = '(a,o)=>{const n=K;return d(),t(s,null,['
+    _FE_DIR = '/config/plugins/DownloadMonitor/fe'
+
     def init_plugin(self, config: Optional[Dict[str, Any]] = None) -> None:
         """读取配置；本插件不使用后台线程，全部数据由面板按需拉取。"""
         self._enabled = False
@@ -118,6 +177,8 @@ class DownloadMonitor(_PluginBase):
                 raw_dl = [x.strip() for x in raw_dl.replace("，", ",").split(",")]
             self._downloaders = [str(n) for n in (raw_dl or []) if n]
         DownloadMonitor._inst = self
+        if self._enabled:
+            threading.Thread(target=self._fe_autopatch, daemon=True).start()
         if self._enabled:
             try:
                 self._poster_start()
@@ -905,6 +966,24 @@ class DownloadMonitor(_PluginBase):
             "}"
         )
 
+        fe_js = (
+            "function(e) {"
+            "  window.MoviePilotAPI.post('plugin/DownloadMonitor/fe_fix', {})"
+            "    .then(function(r) {"
+            "      if (!r || r.success === false) { alert((r && r.message) || '失败'); return; }"
+            "      alert(r.message || '已恢复');"
+            "      if (window.location && window.location.reload) { window.location.reload(); }"
+            "    })"
+            "    .catch(function(err) { console.error(err); alert('失败，请查看日志'); });"
+            "}"
+        )
+        fe_status = DownloadMonitor._fe_status()
+        fe_ok = bool(fe_status.get('patched'))
+        fe_text = (
+            f"筛选栏已生效（{fe_status.get('chunk')} · 版本 {fe_status.get('version') or '—'}）"
+            if fe_ok else
+            "筛选栏未生效（MoviePilot 升级后前端补丁会丢失），点右侧按钮一键恢复"
+        )
         content: List[dict] = []
         if not stats:
             content.append({"component": "VRow", "content": [
@@ -945,6 +1024,15 @@ class DownloadMonitor(_PluginBase):
             {"component": "VCol", "props": {"cols": 12, "md": 6},
              "content": [btn("补全任务封面", "mdi-image-search", "primary", poster_js, "tonal")]},
         ]})
+        content.append({"component": "VRow", "content": [
+            {"component": "VCol", "props": {"cols": 12, "md": 8}, "content": [
+                {"component": "VAlert",
+                 "props": {"type": "success" if fe_ok else "warning", "variant": "tonal",
+                           "density": "compact", "title": "下载管理筛选栏",
+                           "text": fe_text}}]},
+            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                btn("恢复下载管理筛选栏", "mdi-restore", "warning", fe_js, "tonal")]},
+        ]})
 
         # ---- 每个下载器一张卡 ----
         dl_cols: List[dict] = []
@@ -972,6 +1060,188 @@ class DownloadMonitor(_PluginBase):
                                    "（部分种子同时挂在两个下载器上）。"}}]}]})
         return content
 
+
+    # ================= 前端筛选栏补丁（升级后一键恢复） =================
+    @classmethod
+    def _fe_chunk(cls) -> Optional[Path]:
+        """找到当前的下载管理 chunk（升级后文件名会变）。"""
+        assets = Path('/public/assets')
+        if not assets.exists():
+            return None
+        files = list(assets.glob('downloading-*.js'))
+        if not files:
+            return None
+        return max(files, key=lambda p: p.stat().st_mtime)
+
+    @classmethod
+    def _fe_status(cls) -> Dict[str, Any]:
+        """检查筛选栏补丁与缓存穿透版本是否到位。"""
+        chunk = cls._fe_chunk()
+        out: Dict[str, Any] = {'chunk': None, 'patched': False, 'busted': False,
+                               'version': None, 'writable': False}
+        if not chunk:
+            out['message'] = '找不到 /public/assets/downloading-*.js'
+            return out
+        out['chunk'] = chunk.name
+        try:
+            txt = chunk.read_text(encoding='utf-8', errors='ignore')
+            out['patched'] = cls._FE_MARK in txt
+            out['writable'] = os.access(chunk, os.W_OK)
+            idx = Path('/public/index.html')
+            html = idx.read_text(encoding='utf-8', errors='ignore')
+            m = re.search(r'main-[\w-]+\.js\?v=(\w+)', html)
+            out['version'] = m.group(1) if m else None
+            out['busted'] = bool(m)
+        except Exception as err:  # noqa: BLE001
+            out['message'] = f'读取失败: {err}'
+        return out
+
+    @classmethod
+    def _fe_bust(cls, version: str) -> List[str]:
+        """给改过的前端文件加 ?v= 版本号，绕过 Cloudflare 30 天静态缓存。"""
+        touched: List[str] = []
+        public = Path('/public')
+        bak = Path(cls._FE_DIR)
+        bak.mkdir(parents=True, exist_ok=True)
+
+        def backup(p: Path) -> None:
+            dst = bak / (p.name + '.orig')
+            if not dst.exists():
+                dst.write_text(p.read_text(encoding='utf-8', errors='ignore'), encoding='utf-8')
+
+        idx = public / 'index.html'
+        html = idx.read_text(encoding='utf-8', errors='ignore')
+        m_main = re.search(r'\./assets/(main-[\w-]+\.js)', html)
+        m_boot = re.search(r'\./assets/(mf-entry-bootstrap-[\w-]+\.js)', html)
+        if not m_main or not m_boot:
+            raise RuntimeError('index.html 里找不到 main / bootstrap 引用')
+        main_name, boot_name = m_main.group(1), m_boot.group(1)
+
+        # index.html：preload 与 script 引用都带上版本
+        if html.replace('./assets/' + main_name, './assets/' + main_name + '?v=' + version) != html:
+            backup(idx)
+            new_html = re.sub(r'(\./assets/' + re.escape(main_name) + r')(\?v=\w+)?',
+                              r'\1?v=' + version, html)
+            idx.write_text(new_html, encoding='utf-8')
+            touched.append('index.html')
+
+        # bootstrap：它负责加载 main
+        boot = public / 'assets' / boot_name
+        if boot.exists():
+            bt = boot.read_text(encoding='utf-8', errors='ignore')
+            nb = re.sub(r'(\./' + re.escape(main_name) + r')(\?v=\w+)?', r'\1?v=' + version, bt)
+            if nb != bt:
+                backup(boot)
+                boot.write_text(nb, encoding='utf-8')
+                touched.append(boot.name)
+
+        # main：它引用下载管理 chunk
+        main = public / 'assets' / main_name
+        if main.exists():
+            mt = main.read_text(encoding='utf-8', errors='ignore')
+            chunk = cls._fe_chunk()
+            if chunk:
+                nm = re.sub(r'(' + re.escape(chunk.name) + r')(\?v=\w+)?',
+                            r'\1?v=' + version, mt)
+                if nm != mt:
+                    backup(main)
+                    main.write_text(nm, encoding='utf-8')
+                    touched.append(main_name)
+        return touched
+
+    @classmethod
+    def _fe_apply(cls, force: bool = False) -> Dict[str, Any]:
+        """把筛选栏补丁打到当前 chunk 上，并做缓存穿透。幂等，可反复调用。"""
+        chunk = cls._fe_chunk()
+        if not chunk:
+            return {'success': False, 'message': '找不到 /public/assets/downloading-*.js'}
+        try:
+            txt = chunk.read_text(encoding='utf-8', errors='ignore')
+        except Exception as err:  # noqa: BLE001
+            return {'success': False, 'message': f'读取 chunk 失败: {err}'}
+
+        if cls._FE_MARK in txt and not force:
+            try:
+                st = cls._fe_status()
+                ver = st.get('version')
+                if not ver:
+                    ver = 'dmfe' + hashlib.sha1(txt.encode()).hexdigest()[:8]
+                    cls._fe_bust(ver)
+                return {'success': True, 'already': True, 'chunk': chunk.name,
+                        'version': ver, 'message': '筛选栏已存在，无需恢复'}
+            except Exception as err:  # noqa: BLE001
+                return {'success': True, 'already': True, 'chunk': chunk.name,
+                        'message': f'筛选栏已存在（缓存穿透未完成: {err}）'}
+
+        # 结构校验：上游改版就不能盲打
+        missing = []
+        if cls._FE_ANCHOR_USER not in txt:
+            missing.append('用户过滤锚点')
+        if cls._FE_ANCHOR_RENDER not in txt:
+            missing.append('列表渲染锚点')
+        if txt.count('_(f)') < 2:
+            missing.append('任务列表渲染引用')
+        if missing:
+            return {'success': False, 'chunk': chunk.name,
+                    'message': 'MoviePilot 前端结构已变化，自动补丁需要人工适配：缺少 ' + '、'.join(missing)}
+
+        bak = Path(cls._FE_DIR)
+        bak.mkdir(parents=True, exist_ok=True)
+        (bak / (chunk.name + '.orig')).write_text(txt, encoding='utf-8')
+
+        # 1) setup 作用域插入筛选栏状态与过滤逻辑
+        new = txt.replace(cls._FE_ANCHOR_USER,
+                          cls._FE_ANCHOR_USER + cls._FE_HELPER, 1)
+        # 2) 渲染作用域插入节点简写 + 筛选栏 vnode
+        new = new.replace(cls._FE_ANCHOR_RENDER,
+                          '(a,o)=>{const n=K' + cls._FE_ALIAS + ';return d(),t(s,null,['
+                          + cls._FE_BAR, 1)
+        # 3) 只把前两处 _(f) 换成过滤后的列表（后面几处 f 是别的含义）
+        new = new.replace('_(f)', '_(_dmFlt)', 2)
+        if new == txt or cls._FE_MARK not in new:
+            return {'success': False, 'message': '补丁未生效（替换失败）'}
+
+        chunk.write_text(new, encoding='utf-8')
+        version = 'dmfe' + hashlib.sha1(new.encode()).hexdigest()[:8]
+        touched: List[str] = []
+        try:
+            touched = cls._fe_bust(version)
+        except Exception as err:  # noqa: BLE001
+            logger.warning(f'[DownloadMonitor] 缓存穿透失败: {err}')
+
+        # 回读校验
+        back = chunk.read_text(encoding='utf-8', errors='ignore')
+        ok = cls._FE_MARK in back and back.count('_dmFlt') >= 5
+        return {'success': ok, 'chunk': chunk.name, 'version': version,
+                'size_before': len(txt), 'size_after': len(back),
+                'busted': touched,
+                'message': ('筛选栏已恢复：' + chunk.name + '，请刷新页面') if ok else '写入后校验失败'}
+
+    def api_fe_fix(self) -> dict:
+        """恢复前端下载管理筛选栏（升级后一键重打）。"""
+        return DownloadMonitor._fe_apply(force=False)
+
+    def api_fe_status(self) -> dict:
+        """查询筛选栏补丁状态。"""
+        st = DownloadMonitor._fe_status()
+        st['success'] = True
+        return st
+
+
+    @classmethod
+    def _fe_autopatch(cls) -> None:
+        """启动后自检：筛选栏丢失就自动重打（升级后无需手动点）。"""
+        try:
+            time.sleep(6)
+            st = cls._fe_status()
+            if st.get('patched') and st.get('version'):
+                logger.info(f"[DownloadMonitor] 筛选栏补丁在位（{st.get('chunk')} v={st.get('version')}）")
+                return
+            res = cls._fe_apply()
+            logger.info(f"[DownloadMonitor] 筛选栏自动恢复: {res.get('message')}")
+        except Exception as err:  # noqa: BLE001
+            logger.warning(f'[DownloadMonitor] 筛选栏自动恢复失败: {err}')
+
     def get_api(self) -> List[Dict[str, Any]]:
         return [
             {"path": "/rescan", "endpoint": self.api_rescan, "methods": ["POST"],
@@ -982,6 +1252,11 @@ class DownloadMonitor(_PluginBase):
             {"path": "/fill_posters", "endpoint": self.api_fill_posters, "methods": ["POST"],
              "summary": "补全全部任务封面",
              "description": "把当前全部任务的标题入队，由后台线程限速查询 TMDB 海报"},
+            {"path": "/fe_fix", "endpoint": self.api_fe_fix, "methods": ["POST"],
+             "summary": "恢复下载管理筛选栏",
+             "description": "MP 升级后前端补丁会丢，调用即重新打补丁并刷新缓存版本号"},
+            {"path": "/fe_status", "endpoint": self.api_fe_status, "methods": ["GET"],
+             "summary": "筛选栏补丁状态"},
         ]
 
     def api_posters(self) -> dict:
